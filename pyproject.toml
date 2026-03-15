@@ -1,0 +1,74 @@
+[project]
+name = "khoji"
+version = "0.1.0"
+description = "Fine-tune embedding models for domain-specific retrieval using LoRA"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Suyash Harlalka" },
+]
+keywords = [
+    "retrieval",
+    "embeddings",
+    "fine-tuning",
+    "lora",
+    "information-retrieval",
+    "semantic-search",
+    "nlp",
+    "transformers",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.36",
+    "peft>=0.7",
+    "datasets>=2.16",
+    "huggingface-hub>=0.20",
+    "pyyaml>=6.0",
+    "tqdm>=4.60",
+]
+
+[project.urls]
+Homepage = "https://github.com/suyashh94/khoji"
+Repository = "https://github.com/suyashh94/khoji"
+Issues = "https://github.com/suyashh94/khoji/issues"
+Documentation = "https://github.com/suyashh94/khoji#readme"
+
+[project.scripts]
+khoji = "khoji.run:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
