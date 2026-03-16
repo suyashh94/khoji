@@ -19,6 +19,7 @@ from khoji.multimodal_dataset import (
     MultimodalRetrievalDataset,
     load_custom_multimodal,
     load_flickr30k,
+    load_rsicd,
 )
 from khoji.multimodal_evaluator import MultimodalEvaluator
 from khoji.multimodal_model import MultimodalEmbeddingModel
@@ -65,8 +66,12 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
     def _load(source: str, split: str) -> MultimodalRetrievalDataset:
         if Path(source).is_dir():
             return load_custom_multimodal(source)
-        # Assume HuggingFace dataset (e.g., Flickr30k)
-        return load_flickr30k(split=split)
+        if "rsicd" in source.lower():
+            return load_rsicd(split=split, cache_dir=config.data.cache_dir)
+        if "flickr" in source.lower():
+            return load_flickr30k(split=split, cache_dir=config.data.cache_dir)
+        # Default: try as a generic HF dataset name
+        return load_flickr30k(split=split, cache_dir=config.data.cache_dir)
 
     eval_source = config.eval.dataset or config.data.dataset
 

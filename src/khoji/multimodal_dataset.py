@@ -132,6 +132,81 @@ def load_flickr30k(
     )
 
 
+def load_rsicd(
+    split: str = "test",
+    n_samples: int | None = None,
+    cache_dir: str | None = None,
+) -> MultimodalRetrievalDataset:
+    """Load RSICD (Remote Sensing Image Captioning Dataset) from HuggingFace.
+
+    RSICD contains ~10k satellite/aerial images, each with 5 captions.
+    This is a domain where CLIP has not been specifically trained,
+    making it ideal for demonstrating domain adaptation via fine-tuning.
+
+    Each caption becomes a query and its image becomes the relevant document.
+
+    Args:
+        split: Dataset split ("train", "test", or "valid").
+        n_samples: Limit number of images. None = all in split.
+        cache_dir: Where to cache extracted images. Defaults to
+            ``~/.cache/khoji/rsicd``.
+
+    Returns:
+        MultimodalRetrievalDataset with text queries and image file paths.
+    """
+    from datasets import load_dataset
+
+    if cache_dir is None:
+        cache_dir = str(Path.home() / ".cache" / "khoji" / "rsicd")
+    images_dir = Path(cache_dir) / "images" / split
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading RSICD ({split})...")
+    ds = load_dataset("arampacha/rsicd", split=split)
+
+    if n_samples is not None:
+        ds = ds.select(range(min(n_samples, len(ds))))
+
+    queries: dict[str, str] = {}
+    corpus: dict[str, str] = {}
+    qrels: dict[str, dict[str, int]] = {}
+
+    for idx, row in enumerate(ds):
+        doc_id = f"img_{idx}"
+        filename = row.get("filename", f"rsicd_{idx}.jpg")
+        # Use just the basename
+        basename = Path(filename).name
+        if not basename:
+            basename = f"rsicd_{idx}.jpg"
+
+        # Save image to cache if not already there
+        img_path = images_dir / basename
+        if not img_path.exists():
+            row["image"].save(img_path)
+
+        corpus[doc_id] = basename
+
+        # Each image has multiple captions
+        captions = row.get("captions", [])
+        if isinstance(captions, str):
+            captions = [captions]
+
+        for cap_idx, caption in enumerate(captions):
+            qid = f"q_{idx}_{cap_idx}"
+            queries[qid] = caption
+            qrels[qid] = {doc_id: 1}
+
+    print(
+        f"Loaded RSICD ({split}): "
+        f"{len(queries)} queries, {len(corpus)} images, "
+        f"cached at {images_dir}"
+    )
+
+    return MultimodalRetrievalDataset(
+        queries=queries, corpus=corpus, qrels=qrels, base_dir=str(images_dir)
+    )
+
+
 def load_custom_multimodal(path: str) -> MultimodalRetrievalDataset:
     """Load a custom multimodal dataset from a local directory.
 

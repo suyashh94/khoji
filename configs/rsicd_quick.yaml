@@ -1,0 +1,55 @@
+# Quick test config for text-to-image retrieval on RSICD (satellite imagery)
+# Usage: khoji multimodal rsicd_quick.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both        # "vision", "text", or "both"
+
+data:
+  dataset: arampacha/rsicd
+  split: train
+  negatives: random
+  n_negatives: 1
+  n_queries: 50
+  corpus_size: null
+  top_k: 50
+  cache_dir: null          # images cached at ~/.cache/khoji/rsicd by default
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: null
+
+train:
+  epochs: 2
+  batch_size: 4
+  grad_accum_steps: 4      # effective batch size = 16
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 10
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: infonce
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: null
+  overfit_batches: null
+  sanity_check_samples: 10
+  save_every_n_steps: null
+  keep_all_checkpoints: false
+
+seed: null
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: 20
+  corpus_size: 200
+  run_before: false
+  run_after: false
+
+output_dir: ./forge-output/rsicd-quick
