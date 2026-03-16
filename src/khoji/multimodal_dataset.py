@@ -34,22 +34,64 @@ class MultimodalRetrievalDataset:
     base_dir: str | None = None
 
 
-def load_flickr30k(split: str = "test", n_samples: int | None = None) -> MultimodalRetrievalDataset:
+def load_flickr30k(
+    split: str = "test",
+    n_samples: int | None = None,
+    cache_dir: str | None = None,
+) -> MultimodalRetrievalDataset:
     """Load Flickr30k from HuggingFace for text-to-image retrieval.
 
-    Each image has 5 captions. We treat each caption as a separate query
-    and the image as the relevant document.
+    Downloads the annotations CSV and images zip from HuggingFace,
+    extracts images to a local cache, and builds a dataset where
+    each caption is a query and the corresponding image is the document.
 
     Args:
-        split: Dataset split ("test" or "train").
-        n_samples: Limit number of images to load. None = all.
+        split: Dataset split ("train", "val", or "test").
+        n_samples: Limit number of images. None = all in split.
+        cache_dir: Where to cache extracted images. Defaults to
+            ``~/.cache/khoji/flickr30k``.
 
     Returns:
-        MultimodalRetrievalDataset with text queries and image paths.
+        MultimodalRetrievalDataset with text queries and image file paths.
     """
-    from datasets import load_dataset
+    import zipfile
 
-    ds = load_dataset("nlphuji/flickr30k", split=split)
+    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download
+
+    # Set up cache dir for extracted images
+    if cache_dir is None:
+        cache_dir = str(Path.home() / ".cache" / "khoji" / "flickr30k")
+    images_dir = Path(cache_dir) / "images"
+
+    # Download and extract images if not already cached
+    if not images_dir.exists() or not any(images_dir.glob("*.jpg")):
+        print("Downloading Flickr30k images (this may take a while)...")
+        zip_path = hf_hub_download(
+            "nlphuji/flickr30k", "flickr30k-images.zip", repo_type="dataset"
+        )
+        print(f"Extracting images to {images_dir}...")
+        images_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            # Extract only .jpg files, flatten into images_dir
+            for member in zf.namelist():
+                if member.endswith(".jpg"):
+                    filename = Path(member).name
+                    target = images_dir / filename
+                    if not target.exists():
+                        with zf.open(member) as src, open(target, "wb") as dst:
+                            dst.write(src.read())
+        print(f"Extracted {len(list(images_dir.glob('*.jpg')))} images")
+
+    # Load annotations CSV
+    ds = load_dataset(
+        "csv",
+        data_files=f"hf://datasets/nlphuji/flickr30k/flickr_annotations_30k.csv",
+        split="train",  # CSV loads as single split
+    )
+
+    # Filter to requested split
+    ds = ds.filter(lambda row: row["split"] == split)
 
     if n_samples is not None:
         ds = ds.select(range(min(n_samples, len(ds))))
@@ -59,14 +101,19 @@ def load_flickr30k(split: str = "test", n_samples: int | None = None) -> Multimo
     qrels: dict[str, dict[str, int]] = {}
 
     for idx, row in enumerate(ds):
+        filename = row["filename"]
         doc_id = f"img_{idx}"
 
-        # Save image to a temp location (Flickr30k provides PIL images)
-        img = row["image"]
-        corpus[doc_id] = f"__hf_image__{idx}"  # placeholder, handled specially
+        # Corpus entry points to local image file
+        corpus[doc_id] = filename
 
-        # Each image has multiple captions
-        captions = row.get("caption", [])
+        # Parse captions (stored as JSON string in CSV)
+        captions_raw = row["raw"]
+        try:
+            captions = json.loads(captions_raw)
+        except (json.JSONDecodeError, TypeError):
+            captions = [str(captions_raw)]
+
         if isinstance(captions, str):
             captions = [captions]
 
@@ -75,17 +122,14 @@ def load_flickr30k(split: str = "test", n_samples: int | None = None) -> Multimo
             queries[qid] = caption
             qrels[qid] = {doc_id: 1}
 
-    # Store the HF dataset reference for image access
-    dataset = MultimodalRetrievalDataset(
-        queries=queries, corpus=corpus, qrels=qrels
-    )
-    dataset._hf_dataset = ds  # type: ignore[attr-defined]
-
     print(
         f"Loaded Flickr30k ({split}): "
         f"{len(queries)} queries, {len(corpus)} images"
     )
-    return dataset
+
+    return MultimodalRetrievalDataset(
+        queries=queries, corpus=corpus, qrels=qrels, base_dir=str(images_dir)
+    )
 
 
 def load_custom_multimodal(path: str) -> MultimodalRetrievalDataset:
