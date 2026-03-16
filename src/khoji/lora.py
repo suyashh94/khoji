@@ -19,6 +19,12 @@ DEFAULT_TARGET_MODULES: dict[str, list[str]] = {
     "deberta-v2": ["query_proj", "key_proj", "value_proj"],
     "mistral": ["q_proj", "k_proj", "v_proj"],
     "llama": ["q_proj", "k_proj", "v_proj"],
+    "clip": ["q_proj", "k_proj", "v_proj"],
+    "clip_text_model": ["q_proj", "k_proj", "v_proj"],
+    "clip_vision_model": ["q_proj", "k_proj", "v_proj"],
+    "siglip": ["q_proj", "k_proj", "v_proj"],
+    "siglip_text_model": ["q_proj", "k_proj", "v_proj"],
+    "siglip_vision_model": ["q_proj", "k_proj", "v_proj"],
 }
 
 

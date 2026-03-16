@@ -1,26 +1,34 @@
-"""Training script: load config, prepare data, train, evaluate."""
+"""Orchestration for multimodal (text-to-image) training runs."""
 
 from __future__ import annotations
 
 import random
-import sys
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 import torch
 
-from khoji.config import ForgeConfig
-from khoji.data import TripletDataset, build_random_negatives, mine_hard_negatives
-from khoji.dataset import RetrievalDataset, load_beir, load_custom
-from khoji.evaluator import EvalResult, Evaluator
-from khoji.lora import LoRASettings
 from khoji.loss import contrastive_loss, infonce_loss, triplet_margin_loss
-from khoji.model import EmbeddingModel
-from khoji.trainer import TrainHistory, Trainer, TrainingConfig
+from khoji.multimodal_config import MultimodalForgeConfig
+from khoji.multimodal_data import (
+    MultimodalTripletDataset,
+    build_random_negatives_multimodal,
+    mine_hard_negatives_multimodal,
+)
+from khoji.multimodal_dataset import (
+    MultimodalRetrievalDataset,
+    load_custom_multimodal,
+    load_flickr30k,
+)
+from khoji.multimodal_evaluator import MultimodalEvaluator
+from khoji.multimodal_model import MultimodalEmbeddingModel
+from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
+from khoji.lora import LoRASettings
+from khoji.run import RunResult, _set_seed
+from khoji.trainer import TrainHistory
 
 
-def _resolve_loss(config: ForgeConfig):
+def _resolve_loss(config: MultimodalForgeConfig):
     """Map loss name string to the actual loss function."""
     if config.train.loss == "triplet":
         return partial(triplet_margin_loss, margin=config.train.margin)
@@ -29,72 +37,37 @@ def _resolve_loss(config: ForgeConfig):
     elif config.train.loss == "contrastive":
         return contrastive_loss
     else:
-        raise ValueError(f"Unknown loss: {config.train.loss}. Use 'triplet', 'infonce', or 'contrastive'.")
+        raise ValueError(
+            f"Unknown loss: {config.train.loss}. "
+            "Use 'triplet', 'infonce', or 'contrastive'."
+        )
 
 
-def _set_seed(seed: int) -> None:
-    """Set global random seed for reproducibility."""
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    try:
-        import numpy as np
-        np.random.seed(seed)
-    except ImportError:
-        pass
-    if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    print(f"Random seed set to {seed}")
-
-
-@dataclass
-class RunResult:
-    """Everything returned from a training run.
-
-    Attributes:
-        history: Training metrics (step_loss, step_lr, step_grad_norm, epoch_loss).
-        baseline: Baseline eval result (None if eval was disabled).
-        finetuned: Fine-tuned eval result (None if eval was disabled).
-        adapter_dir: Path to saved LoRA adapter.
-        config: The config used for this run.
-    """
-
-    history: TrainHistory
-    baseline: EvalResult | None = None
-    finetuned: EvalResult | None = None
-    adapter_dir: str | None = None
-    config: ForgeConfig | None = None
-
-
-def run(config: ForgeConfig) -> RunResult:
-    """Execute a full training run from config.
+def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
+    """Execute a full multimodal training run from config.
 
     Args:
-        config: ForgeConfig with all settings.
+        config: MultimodalForgeConfig with all settings.
 
     Returns:
         RunResult with training history, eval results, and adapter path.
     """
-    # Set seed early, before any data loading
     if config.seed is not None:
         _set_seed(config.seed)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config for reproducibility
     config.to_yaml(str(output_dir / "config.yaml"))
 
-    result = RunResult(history=TrainHistory(), config=config)
+    result = RunResult(history=TrainHistory(), config=None)
 
-    # --- Dataset loading helpers ---
-    def _load(source: str, split: str) -> RetrievalDataset:
+    # --- Dataset loading ---
+    def _load(source: str, split: str) -> MultimodalRetrievalDataset:
         if Path(source).is_dir():
-            return load_custom(source)
-        return load_beir(source, split=split)
+            return load_custom_multimodal(source)
+        # Assume HuggingFace dataset (e.g., Flickr30k)
+        return load_flickr30k(split=split)
 
-    # Eval dataset can differ from training dataset
     eval_source = config.eval.dataset or config.data.dataset
 
     # --- Baseline evaluation ---
@@ -103,13 +76,18 @@ def run(config: ForgeConfig) -> RunResult:
         print("BASELINE EVALUATION")
         print("=" * 60)
         eval_dataset = _load(eval_source, config.eval.split)
-        evaluator = Evaluator(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
+        evaluator = MultimodalEvaluator(
+            config.model.name,
+            max_length=config.train.max_length,
+            dtype=config.model.dtype,
+        )
         baseline = evaluator.evaluate(
             dataset_name=eval_source,
             k_values=config.eval.k_values,
             n_queries=config.eval.n_queries,
             corpus_size=config.eval.corpus_size,
             dataset=eval_dataset,
+            cache_dir=config.data.cache_dir,
         )
         baseline.print()
         baseline.save(str(output_dir / "baseline.json"))
@@ -122,28 +100,34 @@ def run(config: ForgeConfig) -> RunResult:
     dataset = _load(config.data.dataset, config.data.split)
 
     if config.data.negatives == "hard":
-        mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
-        triplets = mine_hard_negatives(
+        mining_model = MultimodalEmbeddingModel(
+            config.model.name,
+            max_length=config.train.max_length,
+            dtype=config.model.dtype,
+        )
+        triplets = mine_hard_negatives_multimodal(
             dataset,
             mining_model,
             n_negatives=config.data.n_negatives,
             top_k=config.data.top_k,
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
+            cache_dir=config.data.cache_dir,
         )
     else:
-        triplets = build_random_negatives(
+        triplets = build_random_negatives_multimodal(
             dataset,
             n_negatives=config.data.n_negatives,
             n_queries=config.data.n_queries,
         )
 
-    torch_ds = TripletDataset(triplets)
+    torch_ds = MultimodalTripletDataset(triplets)
 
     # --- Training ---
     print("\n" + "=" * 60)
     print("TRAINING")
     print("=" * 60)
+
     lora_settings = None
     if config.lora is not None:
         lora_settings = LoRASettings(
@@ -154,7 +138,17 @@ def run(config: ForgeConfig) -> RunResult:
         )
 
     adapter_dir = str(output_dir / "adapter")
-    training_config = TrainingConfig(
+
+    # Build preprocess overrides dict
+    preprocess_overrides = None
+    if config.preprocess is not None:
+        preprocess_overrides = {
+            "image_size": config.preprocess.image_size,
+            "mean": config.preprocess.mean,
+            "std": config.preprocess.std,
+        }
+
+    training_config = MultimodalTrainingConfig(
         epochs=config.train.epochs,
         batch_size=config.train.batch_size,
         grad_accum_steps=config.train.grad_accum_steps,
@@ -166,15 +160,22 @@ def run(config: ForgeConfig) -> RunResult:
         mixed_precision=config.train.mixed_precision,
         loss_fn=_resolve_loss(config),
         lora=lora_settings,
+        lora_target=config.model.lora_target,
         save_dir=adapter_dir,
         overfit_batches=config.train.overfit_batches,
         sanity_check_samples=config.train.sanity_check_samples,
         save_every_n_steps=config.train.save_every_n_steps,
         keep_all_checkpoints=config.train.keep_all_checkpoints,
         dtype=config.model.dtype,
+        cache_dir=config.data.cache_dir,
+        base_dir=dataset.base_dir,
     )
 
-    trainer = Trainer(config.model.name, training_config)
+    trainer = MultimodalTrainer(
+        config.model.name,
+        training_config,
+        preprocess_overrides=preprocess_overrides,
+    )
     result.history = trainer.train(torch_ds)
     result.adapter_dir = adapter_dir
 
@@ -187,27 +188,19 @@ def run(config: ForgeConfig) -> RunResult:
         print("FINE-TUNED EVALUATION")
         print("=" * 60)
         eval_dataset = _load(eval_source, config.eval.split)
-        if config.lora is not None:
-            # LoRA: load base model + adapter
-            finetuned_evaluator = Evaluator(
-                config.model.name,
-                adapter_path=adapter_dir,
-                max_length=config.train.max_length,
-                dtype=config.model.dtype,
-            )
-        else:
-            # Full fine-tuning: load the saved model directly
-            finetuned_evaluator = Evaluator(
-                adapter_dir,
-                max_length=config.train.max_length,
-                dtype=config.model.dtype,
-            )
+        finetuned_evaluator = MultimodalEvaluator(
+            config.model.name,
+            adapter_path=adapter_dir,
+            max_length=config.train.max_length,
+            dtype=config.model.dtype,
+        )
         finetuned = finetuned_evaluator.evaluate(
             dataset_name=eval_source,
             k_values=config.eval.k_values,
             n_queries=config.eval.n_queries,
             corpus_size=config.eval.corpus_size,
             dataset=eval_dataset,
+            cache_dir=config.data.cache_dir,
         )
         finetuned.print()
         finetuned.save(str(output_dir / "finetuned.json"))
@@ -229,52 +222,3 @@ def run(config: ForgeConfig) -> RunResult:
 
     print(f"\nResults saved to {output_dir}")
     return result
-
-
-def _init_configs(target_dir: str = ".") -> None:
-    """Generate example config files in the target directory."""
-    from khoji.example_configs import CONFIGS
-
-    target = Path(target_dir)
-    target.mkdir(parents=True, exist_ok=True)
-
-    for name, content in CONFIGS.items():
-        path = target / name
-        path.write_text(content)
-        print(f"  Created {path}")
-
-    print(f"\nGenerated {len(CONFIGS)} example configs in {target}/")
-    print("Run:  khoji fiqa_quick.yaml")
-
-
-def main():
-    """CLI entry point."""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  khoji <config.yaml>              Run a text-text training pipeline")
-        print("  khoji multimodal <config.yaml>   Run a text-to-image training pipeline")
-        print("  khoji init [directory]            Generate example config files")
-        sys.exit(1)
-
-    if sys.argv[1] == "init":
-        target = sys.argv[2] if len(sys.argv) > 2 else "."
-        _init_configs(target)
-        return
-
-    if sys.argv[1] == "multimodal":
-        if len(sys.argv) < 3:
-            print("Usage: khoji multimodal <config.yaml>")
-            sys.exit(1)
-        from khoji.multimodal_config import MultimodalForgeConfig
-        from khoji.multimodal_run import run_multimodal
-
-        config = MultimodalForgeConfig.from_yaml(sys.argv[2])
-        run_multimodal(config)
-        return
-
-    config = ForgeConfig.from_yaml(sys.argv[1])
-    run(config)
-
-
-if __name__ == "__main__":
-    main()

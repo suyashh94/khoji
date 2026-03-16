@@ -2,21 +2,25 @@
 
 **Fine-tune embedding models for domain-specific retrieval using LoRA**
 
-[Installation](#installation) | [Quick Start](#quick-start) | [Configuration](#configuration-reference) | [Python API](#python-api) | [Architecture](#architecture) | [Contributing](#development)
+[Installation](#installation) | [Quick Start](#quick-start) | [Text-to-Text](#configuration-reference) | [Text-to-Image](#text-to-image-retrieval) | [Python API](#python-api) | [Architecture](#architecture)
 
 ---
 
-**khoji** is a lightweight, modular Python library for fine-tuning transformer-based embedding models on domain-specific retrieval tasks. It uses [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) for parameter-efficient training, supports multiple loss functions, and provides end-to-end evaluation with standard IR metrics — all written from scratch with no dependency on high-level evaluation frameworks.
+**khoji** is a lightweight, modular Python library for fine-tuning retrieval models on domain-specific data using [LoRA](https://arxiv.org/abs/2106.09685). It supports both **text-to-text** and **text-to-image** retrieval, multiple loss functions, and end-to-end evaluation with standard IR metrics — all written from scratch with no dependency on high-level evaluation frameworks.
 
 **Key features:**
 
+- **Two retrieval modes:** text-to-text (BERT, sentence-transformers) and text-to-image (CLIP, SigLIP)
 - Parameter-efficient fine-tuning via LoRA (only adapter weights are trained and saved)
+- Full fine-tuning support (`lora: null`)
 - Multiple loss functions: Triplet Margin, InfoNCE, Contrastive
 - Hard negative mining using model embeddings
 - Custom retrieval metrics: nDCG@k, MRR@k, Recall@k — implemented from scratch
 - Auto-detection of model pooling strategy and LoRA target modules
 - YAML-driven configuration for reproducible experiments
 - Full Python API — inspect training history, plot loss curves, programmatic access to everything
+- Image loading from local files or URLs with optional caching
+- Custom models, loss functions, metrics, and image preprocessing — all pluggable
 - Hardware support: CUDA, Apple Silicon (MPS), and CPU
 
 ---
@@ -58,25 +62,37 @@ uv sync --group dev   # installs pytest, ruff
 ### CLI
 
 ```bash
-# Generate example config files in the current directory
+# Generate example config files (text-text and text-image)
 khoji init
 
-# Or in a specific directory
-khoji init configs/
-
-# Run a quick training experiment on FiQA
+# Text-to-text retrieval (e.g., BERT, BGE)
 khoji fiqa_quick.yaml
 
-# Or via Python module
-python -m khoji.run fiqa_quick.yaml
+# Text-to-image retrieval (e.g., CLIP, SigLIP)
+khoji multimodal flickr30k_quick.yaml
 ```
 
 ### Python API
 
 ```python
+# Text-to-text
 from khoji import ForgeConfig, run
 
-# Load config and run full pipeline
+config = ForgeConfig.from_yaml("fiqa_quick.yaml")
+result = run(config)
+
+# Text-to-image
+from khoji import MultimodalForgeConfig, run_multimodal
+
+config = MultimodalForgeConfig.from_yaml("flickr30k_quick.yaml")
+result = run_multimodal(config)
+```
+
+### Text-to-text example
+
+```python
+from khoji import ForgeConfig, run
+
 config = ForgeConfig.from_yaml("configs/fiqa_quick.yaml")
 result = run(config)
 
@@ -997,22 +1013,284 @@ train:
 
 ---
 
+## Text-to-Image Retrieval
+
+khoji supports cross-modal retrieval where queries are text and documents are images. It works with CLIP and SigLIP models out of the box.
+
+### Quick start (CLI)
+
+```bash
+khoji init                              # generates example configs
+khoji multimodal flickr30k_quick.yaml   # train on Flickr30k
+```
+
+### Quick start (Python API)
+
+```python
+from khoji import MultimodalEmbeddingModel, MultimodalForgeConfig, run_multimodal
+
+# Inference with CLIP
+model = MultimodalEmbeddingModel("openai/clip-vit-base-patch32")
+text_emb = model.encode_text(["a dog playing fetch"])
+img_emb = model.encode_image_sources(["photos/dog.jpg"], base_dir="./my_data")
+
+import torch
+similarity = torch.mm(text_emb, img_emb.t())
+print(f"Similarity: {similarity.item():.4f}")
+
+# Full training pipeline
+config = MultimodalForgeConfig.from_yaml("flickr30k_quick.yaml")
+result = run_multimodal(config)
+```
+
+### Multimodal configuration reference
+
+```yaml
+# ── Model ─────────────────────────────────────────────────────────
+model:
+  name: openai/clip-vit-base-patch32   # CLIP or SigLIP model
+  adapter_path: null                    # path to existing adapter
+  dtype: null                           # "fp16", "bf16", or null
+  lora_target: both                     # "vision", "text", or "both"
+
+# ── Data ──────────────────────────────────────────────────────────
+data:
+  dataset: nlphuji/flickr30k            # HF dataset or local path
+  split: train
+  negatives: random                     # "random" or "hard"
+  n_negatives: 1
+  n_queries: null                       # null = all
+  corpus_size: null                     # null = all
+  top_k: 50                             # for hard negative mining
+  cache_dir: null                       # cache downloaded images
+
+# ── LoRA ──────────────────────────────────────────────────────────
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: null                  # auto-detect (q_proj, k_proj, v_proj for CLIP)
+
+# ── Training ──────────────────────────────────────────────────────
+train:
+  epochs: 3
+  batch_size: 8
+  grad_accum_steps: 4
+  lr: 2e-5
+  max_length: 77                        # CLIP default token length
+  loss: infonce
+  temperature: 0.05
+  mixed_precision: bf16
+  # ... all other train params same as text-to-text
+
+# ── Image Preprocessing (optional overrides) ─────────────────────
+# preprocess:
+#   image_size: 224
+#   mean: [0.48145466, 0.4578275, 0.40821073]
+#   std: [0.26862954, 0.26130258, 0.27577711]
+
+seed: 42
+
+eval:
+  k_values: [1, 5, 10]
+  run_before: true
+  run_after: true
+
+output_dir: ./forge-output/flickr30k
+```
+
+#### `model` (multimodal)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | `openai/clip-vit-base-patch32` | CLIP or SigLIP model from HuggingFace. |
+| `adapter_path` | `str \| null` | `null` | Path to existing LoRA adapter. |
+| `dtype` | `str \| null` | `null` | Load model in "fp16", "bf16", or null (fp32). |
+| `lora_target` | `str` | `both` | Which encoder(s) to apply LoRA to: `"vision"`, `"text"`, or `"both"`. |
+
+#### `data` (multimodal)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dataset` | `str` | `nlphuji/flickr30k` | HF dataset name or path to local directory. |
+| `cache_dir` | `str \| null` | `null` | Cache directory for downloaded images. `null` = stream without saving. |
+
+All other data/train/eval parameters are the same as text-to-text.
+
+#### `preprocess` (optional)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image_size` | `int \| null` | `null` | Override image resize. `null` = auto from model. |
+| `mean` | `list[float] \| null` | `null` | Override normalization mean [R, G, B]. |
+| `std` | `list[float] \| null` | `null` | Override normalization std [R, G, B]. |
+
+### Custom image datasets
+
+Create a directory with three files:
+
+```
+my_image_dataset/
+  queries.jsonl      # {"_id": "q1", "text": "a dog playing fetch"}
+  corpus.jsonl       # {"_id": "d1", "image": "images/dog.jpg"}   (relative path or URL)
+  qrels.tsv          # q1\td1\t1
+  images/            # local images (optional if using URLs)
+```
+
+**corpus.jsonl** uses an `image` field instead of `text`:
+```json
+{"_id": "d1", "image": "images/photo1.jpg"}
+{"_id": "d2", "image": "https://example.com/photo2.jpg"}
+```
+
+Image paths are relative to the dataset directory. URLs are also supported — they are streamed and not saved to disk unless `cache_dir` is set.
+
+### LoRA targeting for multimodal models
+
+Control which encoder(s) LoRA is applied to:
+
+```yaml
+model:
+  lora_target: vision    # only fine-tune the vision encoder
+```
+
+| Value | What's trained | When to use |
+|-------|---------------|-------------|
+| `both` | Text + vision encoders | Default. Best for domain adaptation. |
+| `vision` | Vision encoder only | When text understanding is already good, images are domain-specific. |
+| `text` | Text encoder only | When images are generic but queries are domain-specific. |
+
+### Multimodal Python API (component-by-component)
+
+```python
+from khoji import (
+    MultimodalEmbeddingModel,
+    MultimodalEvaluator,
+    MultimodalTrainer,
+    MultimodalTrainingConfig,
+    MultimodalTripletDataset,
+    MultimodalRetrievalDataset,
+    build_random_negatives_multimodal,
+    load_custom_multimodal,
+    LoRASettings,
+)
+
+# 1. Load dataset
+dataset = load_custom_multimodal("./my_image_dataset")
+
+# 2. Build triplets
+triplets = build_random_negatives_multimodal(dataset, n_negatives=1)
+torch_ds = MultimodalTripletDataset(triplets)
+
+# 3. Train
+config = MultimodalTrainingConfig(
+    epochs=3,
+    batch_size=8,
+    lr=2e-5,
+    max_length=77,
+    lora=LoRASettings(r=8, alpha=16),
+    lora_target="both",
+    save_dir="./my-clip-adapter",
+    base_dir="./my_image_dataset",
+)
+trainer = MultimodalTrainer("openai/clip-vit-base-patch32", config)
+history = trainer.train(torch_ds)
+
+# 4. Evaluate
+evaluator = MultimodalEvaluator(
+    "openai/clip-vit-base-patch32",
+    adapter_path="./my-clip-adapter",
+)
+result = evaluator.evaluate(dataset=dataset, k_values=[1, 5, 10])
+result.print()
+
+# 5. Inference
+model = MultimodalEmbeddingModel(
+    "openai/clip-vit-base-patch32",
+    adapter_path="./my-clip-adapter",
+)
+query_emb = model.encode_text(["a photo of a sunset"])
+img_emb = model.encode_image_sources(
+    ["sunset1.jpg", "sunset2.jpg", "cat.jpg"],
+    base_dir="./photos",
+)
+
+import torch
+scores = torch.mm(query_emb, img_emb.t()).squeeze(0)
+top_idx = torch.topk(scores, k=3).indices.tolist()
+```
+
+### Custom multimodal models
+
+Bring your own text and vision encoders:
+
+```python
+from khoji import MultimodalEmbeddingModel, MultimodalTrainer, MultimodalTrainingConfig
+
+# Custom models must satisfy:
+#   text_model: nn.Module, forward(**tokenizer_outputs) -> object with .pooler_output or .last_hidden_state
+#   vision_model: nn.Module, forward(pixel_values) -> object with .pooler_output or .last_hidden_state
+#   image_processor: callable, list[PIL.Image] -> torch.Tensor (batched pixel values)
+
+model = MultimodalEmbeddingModel(
+    text_model=my_text_encoder,
+    vision_model=my_vision_encoder,
+    tokenizer=my_tokenizer,
+    image_processor=my_processor,
+)
+
+# Training works the same way
+trainer = MultimodalTrainer(
+    text_model=my_text_encoder,
+    vision_model=my_vision_encoder,
+    tokenizer=my_tokenizer,
+    image_processor=my_processor,
+    config=MultimodalTrainingConfig(epochs=3, lora=None),
+)
+```
+
+### Supported multimodal models
+
+| Model | Type | Embedding Dim |
+|-------|------|--------------|
+| `openai/clip-vit-base-patch32` | CLIP | 512 |
+| `openai/clip-vit-large-patch14` | CLIP | 768 |
+| `google/siglip-base-patch16-224` | SigLIP | 768 |
+
+Any CLIP or SigLIP variant on HuggingFace should work.
+
+---
+
 ## Architecture
 
 ```
 khoji/
-  __init__.py          # Public API exports
-  config.py            # YAML config dataclasses (ForgeConfig)
-  run.py               # Orchestration: data prep -> train -> eval (RunResult)
-  dataset.py           # BEIR dataset loading (load_beir, RetrievalDataset)
-  data.py              # Triplet construction, hard negative mining
-  model.py             # Embedding model with pooling auto-detection
-  lora.py              # LoRA configuration and application
-  trainer.py           # Training loop with grad accumulation, clipping, scheduling
-  loss.py              # Loss functions (triplet, infonce, contrastive)
-  evaluator.py         # Retrieval evaluation (nDCG, MRR, Recall)
-  metrics.py           # Individual metric implementations
-  device.py            # Hardware auto-detection (CUDA > MPS > CPU)
+  # ── Text-to-text ────────────────────────────────────
+  config.py                  # YAML config (ForgeConfig)
+  run.py                     # Orchestration + CLI entry point
+  dataset.py                 # BEIR loading (load_beir, RetrievalDataset)
+  data.py                    # Triplet construction, hard negative mining
+  model.py                   # Embedding model with pooling auto-detection
+  trainer.py                 # Training loop
+  evaluator.py               # Retrieval evaluation (nDCG, MRR, Recall)
+
+  # ── Text-to-image ───────────────────────────────────
+  multimodal_config.py       # YAML config (MultimodalForgeConfig)
+  multimodal_run.py          # Orchestration for multimodal
+  multimodal_dataset.py      # Flickr30k + custom image datasets
+  multimodal_data.py         # Multimodal triplets + negative mining
+  multimodal_model.py        # CLIP/SigLIP embedding model
+  multimodal_trainer.py      # Training with text queries + image docs
+  multimodal_evaluator.py    # Cross-modal evaluation
+  image_utils.py             # Image loading (local + URL + cache)
+
+  # ── Shared ──────────────────────────────────────────
+  loss.py                    # Loss functions (triplet, infonce, contrastive)
+  metrics.py                 # nDCG, MRR, Recall implementations
+  lora.py                    # LoRA configuration and application
+  device.py                  # Hardware auto-detection (CUDA > MPS > CPU)
+  example_configs.py         # Bundled YAML templates for khoji init
 ```
 
 ### Data flow
@@ -1052,15 +1330,22 @@ RunResult (history + baseline + finetuned + adapter_dir)
 uv run pytest tests/ -v
 ```
 
-### Test coverage
+### Test coverage (118 tests)
 
 | Module | What's tested |
 |--------|--------------|
 | `metrics.py` | nDCG@k, MRR@k, Recall@k — edge cases, perfect/worst rankings, graded relevance, k cutoffs |
 | `model.py` | All 6 pooling modes (with/without padding), pooling auto-detection, embedding shape and L2 normalization |
 | `data.py` | TripletDataset, random negatives (determinism, relevance correctness), hard negatives (semantic similarity) |
-| `device.py` | Device selection returns valid device, tensor creation works on selected device |
-| `integration` | BEIR dataset loading, retrieval sanity checks (relevant docs rank higher than random) |
+| `loss.py` | All 3 loss functions — shapes, values, edge cases, gradient flow |
+| `config.py` | `_resolve_dtype`, `_coerce_train_config`, YAML roundtrip/defaults/partial override |
+| `lora.py` | LoRA settings, `apply_lora`, auto-detection, custom target modules |
+| `evaluator.py` | Evaluator with custom dataset, extra metrics, save/to_dict |
+| `trainer.py` | TrainHistory save/to_dict, history fields populated correctly |
+| `dataset.py` | `load_custom` (load, titles, missing files), `RetrievalDataset` construction |
+| `device.py` | Device selection, tensor creation on selected device |
+| `integration` | BEIR dataset loading, retrieval sanity checks |
+| `multimodal` | Image loading, CLIP encoding (text + images), multimodal config, custom datasets, random negatives, training loop, LoRA targeting, cross-modal evaluation |
 
 ### Linting
 
@@ -1074,6 +1359,9 @@ uv run ruff check src/ tests/
 
 Planned features and known gaps:
 
+- [x] **Text-to-text retrieval** — BERT, BGE, sentence-transformers
+- [x] **Text-to-image retrieval** — CLIP, SigLIP
+- [x] **Full fine-tuning** — `lora: null` for training all parameters
 - [ ] **Validation loss tracking** — monitor loss on a held-out set during training
 - [ ] **Early stopping** — stop training when validation metric stops improving
 - [ ] **Distributed training** — multi-GPU support via DDP
@@ -1081,7 +1369,7 @@ Planned features and known gaps:
 - [ ] **Adapter merging** — merge LoRA weights back into base model for faster inference
 - [ ] **Benchmark suite** — automated evaluation across multiple BEIR datasets
 - [ ] **Logging integration** — Weights & Biases, TensorBoard support
-- [ ] **Multi-positive contrastive learning** — leverage multiple positives per query in a single forward pass
+- [ ] **Image-to-image retrieval** — extend multimodal to support image queries
 
 ---
 
