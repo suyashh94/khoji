@@ -134,6 +134,8 @@ data:
   # top_k: 50                        # Top-k corpus docs to consider for hard negative mining
 
 # ── LoRA ──────────────────────────────────────────────────────────
+# Set to null for full fine-tuning (all parameters trained):
+#   lora: null
 lora:
   r: 8                                # LoRA rank (higher = more parameters, more capacity)
   alpha: 16                           # LoRA scaling factor (typically 2x rank)
@@ -204,6 +206,14 @@ output_dir: ./forge-output            # Directory for adapter weights, configs, 
 | `top_k` | `int` | `50` | Only for `negatives: hard`. Number of top similar docs to consider when mining negatives. |
 
 #### `lora`
+
+Set the entire `lora` section to `null` to disable LoRA and train **all model parameters** (full fine-tuning):
+
+```yaml
+lora: null    # full fine-tuning — all parameters are trained and saved
+```
+
+When `lora` is set (default), only the LoRA adapter weights are trained and saved:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -693,6 +703,37 @@ Any HuggingFace model compatible with `AutoModel` / `AutoTokenizer` is supported
 ## Extensibility
 
 Every major component is pluggable. You can bring your own model, loss function, or metrics without forking the library.
+
+### Full fine-tuning (no LoRA)
+
+By default, khoji uses LoRA for parameter-efficient training. To train **all model parameters** instead, set `lora: null` in your YAML config:
+
+```yaml
+lora: null    # train all parameters, not just LoRA adapters
+
+train:
+  epochs: 3
+  lr: 1e-5    # use a lower learning rate for full fine-tuning
+```
+
+Or via the Python API:
+
+```python
+from khoji import Trainer, TrainingConfig
+
+config = TrainingConfig(
+    epochs=3,
+    lr=1e-5,
+    lora=None,    # full fine-tuning
+    save_dir="./my-full-model",
+)
+trainer = Trainer("BAAI/bge-base-en-v1.5", config)
+```
+
+**Notes:**
+- Full fine-tuning trains and saves **all** model weights (hundreds of MB), whereas LoRA only saves adapter weights (~few MB).
+- Use a lower learning rate (`1e-5` to `5e-6`) compared to LoRA fine-tuning to avoid catastrophic forgetting.
+- Requires more GPU memory since all parameters need gradients.
 
 ### Custom models (non-HuggingFace)
 

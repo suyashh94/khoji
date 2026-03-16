@@ -89,7 +89,7 @@ class ForgeConfig:
 
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
-    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    lora: LoRAConfig | None = field(default_factory=LoRAConfig)  # null = full fine-tuning
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     seed: int | None = None  # global seed for reproducibility
@@ -108,7 +108,10 @@ class ForgeConfig:
         if "data" in raw:
             config.data = DataConfig(**raw["data"])
         if "lora" in raw:
-            config.lora = LoRAConfig(**raw["lora"])
+            if raw["lora"] is None:
+                config.lora = None
+            else:
+                config.lora = LoRAConfig(**raw["lora"])
         if "train" in raw:
             config.train = _coerce_train_config(raw["train"])
         if "eval" in raw:

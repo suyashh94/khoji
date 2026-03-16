@@ -144,12 +144,14 @@ def run(config: ForgeConfig) -> RunResult:
     print("\n" + "=" * 60)
     print("TRAINING")
     print("=" * 60)
-    lora_settings = LoRASettings(
-        r=config.lora.r,
-        alpha=config.lora.alpha,
-        dropout=config.lora.dropout,
-        target_modules=config.lora.target_modules,
-    )
+    lora_settings = None
+    if config.lora is not None:
+        lora_settings = LoRASettings(
+            r=config.lora.r,
+            alpha=config.lora.alpha,
+            dropout=config.lora.dropout,
+            target_modules=config.lora.target_modules,
+        )
 
     adapter_dir = str(output_dir / "adapter")
     training_config = TrainingConfig(
@@ -185,12 +187,21 @@ def run(config: ForgeConfig) -> RunResult:
         print("FINE-TUNED EVALUATION")
         print("=" * 60)
         eval_dataset = _load(eval_source, config.eval.split)
-        finetuned_evaluator = Evaluator(
-            config.model.name,
-            adapter_path=adapter_dir,
-            max_length=config.train.max_length,
-            dtype=config.model.dtype,
-        )
+        if config.lora is not None:
+            # LoRA: load base model + adapter
+            finetuned_evaluator = Evaluator(
+                config.model.name,
+                adapter_path=adapter_dir,
+                max_length=config.train.max_length,
+                dtype=config.model.dtype,
+            )
+        else:
+            # Full fine-tuning: load the saved model directly
+            finetuned_evaluator = Evaluator(
+                adapter_dir,
+                max_length=config.train.max_length,
+                dtype=config.model.dtype,
+            )
         finetuned = finetuned_evaluator.evaluate(
             dataset_name=eval_source,
             k_values=config.eval.k_values,

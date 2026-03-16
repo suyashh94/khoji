@@ -13,6 +13,7 @@ data:
   corpus_size: null        # full corpus
   top_k: 50                # top-k for hard negative mining
 
+# Set to null for full fine-tuning: lora: null
 lora:
   r: 16
   alpha: 32

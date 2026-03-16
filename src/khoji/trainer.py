@@ -327,12 +327,13 @@ class Trainer:
         return history
 
     def save(self, path: str) -> None:
-        """Save the LoRA adapter weights."""
+        """Save the model weights (LoRA adapter or full model)."""
         save_path = Path(path)
         save_path.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
-        print(f"LoRA adapter saved to {save_path}")
+        label = "LoRA adapter" if self.config.lora is not None else "Full model"
+        print(f"{label} saved to {save_path}")
 
     def _save_checkpoint(self, step: int) -> None:
         """Save a checkpoint during training."""
