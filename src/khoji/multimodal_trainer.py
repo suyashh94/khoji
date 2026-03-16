@@ -225,15 +225,24 @@ class MultimodalTrainer:
         history = TrainHistory()
 
         # Overfit mode
+        overfit_samples = None
         if self.config.overfit_batches is not None:
             n = self.config.overfit_batches
             subset = [dataset[i] for i in range(min(n * self.config.batch_size, len(dataset)))]
             from khoji.multimodal_data import MultimodalTriplet
 
             dataset = MultimodalTripletDataset([MultimodalTriplet(*s) for s in subset])
+            overfit_samples = subset
             print(f"\n[OVERFIT MODE] Training on {len(dataset)} samples for {self.config.epochs} epochs")
+            self._overfit_report("BEFORE training", overfit_samples)
         else:
             print(f"\nTraining on {len(dataset)} triplets for {self.config.epochs} epochs")
+            if self.config.sanity_check_samples > 0:
+                import random
+                n_check = min(self.config.sanity_check_samples, len(dataset))
+                indices = random.sample(range(len(dataset)), n_check)
+                overfit_samples = [dataset[i] for i in indices]
+                self._overfit_report("BEFORE training", overfit_samples)
 
         dataloader = DataLoader(
             dataset,
@@ -369,6 +378,10 @@ class MultimodalTrainer:
 
         pbar.close()
 
+        # Show after-training metrics
+        if overfit_samples is not None:
+            self._overfit_report("AFTER training", overfit_samples)
+
         if self.config.save_dir:
             self.save(self.config.save_dir)
 
@@ -409,6 +422,48 @@ class MultimodalTrainer:
             torch.save(self.vision_encoder.state_dict(), ckpt_dir / "vision_encoder.pt")
         self.tokenizer.save_pretrained(ckpt_dir)
         tqdm.write(f"  Checkpoint saved to {ckpt_dir}")
+
+    @torch.no_grad()
+    def _overfit_report(self, label: str, samples: list[tuple[str, str, str]]) -> None:
+        """Print cosine similarity metrics for sanity check samples.
+
+        Shows per-sample cos_sim(query, positive_image) and cos_sim(query, negative_image),
+        plus the margin (pos - neg) and whether the model ranks the positive higher.
+        """
+        self.text_encoder.eval()
+        self.vision_encoder.eval()
+
+        queries = [s[0] for s in samples]
+        positives = [s[1] for s in samples]
+        negatives = [s[2] for s in samples]
+
+        q_emb = self._encode_text_batch(queries)
+        p_emb = self._encode_image_batch(positives)
+        n_emb = self._encode_image_batch(negatives)
+
+        pos_sim = torch.nn.functional.cosine_similarity(q_emb, p_emb)
+        neg_sim = torch.nn.functional.cosine_similarity(q_emb, n_emb)
+        margin = pos_sim - neg_sim
+
+        print(f"\n  [{label}] Sanity check ({len(samples)} samples):")
+        print(f"    Avg cos_sim(query, pos_image):   {pos_sim.mean().item():.4f}")
+        print(f"    Avg cos_sim(query, neg_image):   {neg_sim.mean().item():.4f}")
+        print(f"    Avg margin (pos - neg):          {margin.mean().item():.4f}")
+        print(f"    Samples where pos > neg:         {(margin > 0).sum().item()}/{len(samples)}")
+
+        if len(samples) <= 10:
+            print(f"    {'Sample':<8} {'pos_sim':>8} {'neg_sim':>8} {'margin':>8} {'correct':>8}")
+            print(f"    {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+            for i in range(len(samples)):
+                correct = "yes" if margin[i].item() > 0 else "NO"
+                print(
+                    f"    {i:<8} {pos_sim[i].item():>8.4f} {neg_sim[i].item():>8.4f} "
+                    f"{margin[i].item():>8.4f} {correct:>8}"
+                )
+        print()
+
+        self.text_encoder.train()
+        self.vision_encoder.train()
 
     def _encode_text_batch(self, texts: list[str] | tuple[str, ...]) -> torch.Tensor:
         """Encode a batch of text queries."""
