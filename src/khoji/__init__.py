@@ -1,6 +1,6 @@
 """khoji: Fine-tune embedding models for domain-specific retrieval."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from khoji.config import ForgeConfig
 from khoji.data import Triplet, TripletDataset, build_random_negatives, mine_hard_negatives
