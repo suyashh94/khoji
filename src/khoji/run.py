@@ -220,11 +220,34 @@ def run(config: ForgeConfig) -> RunResult:
     return result
 
 
+def _init_configs(target_dir: str = ".") -> None:
+    """Generate example config files in the target directory."""
+    from khoji.example_configs import CONFIGS
+
+    target = Path(target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+
+    for name, content in CONFIGS.items():
+        path = target / name
+        path.write_text(content)
+        print(f"  Created {path}")
+
+    print(f"\nGenerated {len(CONFIGS)} example configs in {target}/")
+    print("Run:  khoji fiqa_quick.yaml")
+
+
 def main():
-    """CLI entry point: `python -m khoji.run config.yaml`"""
+    """CLI entry point."""
     if len(sys.argv) < 2:
-        print("Usage: khoji <config.yaml>")
+        print("Usage:")
+        print("  khoji <config.yaml>        Run a training pipeline")
+        print("  khoji init [directory]      Generate example config files")
         sys.exit(1)
+
+    if sys.argv[1] == "init":
+        target = sys.argv[2] if len(sys.argv) > 2 else "."
+        _init_configs(target)
+        return
 
     config = ForgeConfig.from_yaml(sys.argv[1])
     run(config)

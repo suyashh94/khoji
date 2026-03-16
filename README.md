@@ -58,11 +58,17 @@ uv sync --group dev   # installs pytest, ruff
 ### CLI
 
 ```bash
+# Generate example config files in the current directory
+khoji init
+
+# Or in a specific directory
+khoji init configs/
+
 # Run a quick training experiment on FiQA
-khoji configs/fiqa_quick.yaml
+khoji fiqa_quick.yaml
 
 # Or via Python module
-python -m khoji.run configs/fiqa_quick.yaml
+python -m khoji.run fiqa_quick.yaml
 ```
 
 ### Python API
