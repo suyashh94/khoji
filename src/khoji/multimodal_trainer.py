@@ -97,6 +97,9 @@ class MultimodalTrainer:
 
         elif model_name is not None:
             self._load_hf_model(model_name, preprocess_overrides)
+            # Allow custom image_processor to override the auto-detected one
+            if image_processor is not None:
+                self.image_processor = image_processor
 
         else:
             raise ValueError("Provide either model_name or (text_model + vision_model).")

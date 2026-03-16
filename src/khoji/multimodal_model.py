@@ -90,6 +90,9 @@ class MultimodalEmbeddingModel:
             # HuggingFace model path
             self.model_type = _detect_model_type(model_name)
             self._load_hf_model(model_name, adapter_path, dtype, preprocess_overrides)
+            # Allow custom image_processor to override the auto-detected one
+            if image_processor is not None:
+                self.image_processor = image_processor
 
         else:
             raise ValueError(

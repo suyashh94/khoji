@@ -1120,11 +1120,58 @@ All other data/train/eval parameters are the same as text-to-text.
 
 #### `preprocess` (optional)
 
+Controls how images are resized and normalized before being fed to the vision encoder. There are **three tiers** of preprocessing, from most to least automatic:
+
+**Tier 1 — Auto (default):** When `preprocess` is omitted, khoji loads the model's `AutoProcessor` from HuggingFace. For CLIP ViT-B/32 this means: resize to 224px, center crop, normalize with `mean=[0.481, 0.458, 0.408]`, `std=[0.269, 0.261, 0.276]`. This is the right default for standard models.
+
+**Tier 2 — YAML overrides:** Set specific values to override the auto-detected ones. Useful when using a fine-tuned CLIP variant trained at a different resolution, or when your domain images have unusual color distributions (e.g., medical imaging, satellite imagery):
+
+```yaml
+preprocess:
+  image_size: 336          # override resize (e.g., for ViT-L/14@336px)
+  mean: [0.5, 0.5, 0.5]   # custom normalization
+  std: [0.5, 0.5, 0.5]
+```
+
+**Tier 3 — Custom callable (Python API only):** Pass your own preprocessing function for full control — custom augmentations, domain-specific transforms, etc. This works with both HuggingFace and custom models:
+
+```python
+import torch
+import torchvision.transforms as T
+from PIL import Image
+
+# Example: custom preprocessing with augmentation
+transform = T.Compose([
+    T.Resize(224),
+    T.CenterCrop(224),
+    T.RandomHorizontalFlip(p=0.5),  # augmentation for training
+    T.ToTensor(),
+    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+])
+
+def my_preprocessor(images: list[Image.Image]) -> torch.Tensor:
+    return torch.stack([transform(img) for img in images])
+
+# Use with HuggingFace model — overrides the auto-detected preprocessor
+from khoji import MultimodalEmbeddingModel, MultimodalTrainer, MultimodalTrainingConfig
+
+model = MultimodalEmbeddingModel(
+    "openai/clip-vit-base-patch32",
+    image_processor=my_preprocessor,  # overrides AutoProcessor
+)
+
+trainer = MultimodalTrainer(
+    "openai/clip-vit-base-patch32",
+    image_processor=my_preprocessor,  # also works in training
+    config=MultimodalTrainingConfig(...),
+)
+```
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `image_size` | `int \| null` | `null` | Override image resize. `null` = auto from model. |
-| `mean` | `list[float] \| null` | `null` | Override normalization mean [R, G, B]. |
-| `std` | `list[float] \| null` | `null` | Override normalization std [R, G, B]. |
+| `image_size` | `int \| null` | `null` | Override shortest-edge resize. `null` = auto from model (224 for CLIP ViT-B/32). |
+| `mean` | `list[float] \| null` | `null` | Override normalization mean `[R, G, B]`. `null` = auto from model. |
+| `std` | `list[float] \| null` | `null` | Override normalization std `[R, G, B]`. `null` = auto from model. |
 
 ### Custom image datasets
 
@@ -1223,30 +1270,75 @@ top_idx = torch.topk(scores, k=3).indices.tolist()
 
 ### Custom multimodal models
 
-Bring your own text and vision encoders:
+Bring your own text and vision encoders. The requirements:
+
+- **text_model**: `nn.Module` whose `forward(**tokenizer_outputs)` returns an object with `.pooler_output` (preferred) or `.last_hidden_state` (falls back to CLS token).
+- **vision_model**: `nn.Module` whose `forward(pixel_values)` returns an object with `.pooler_output` or `.last_hidden_state`.
+- **tokenizer**: Anything that supports `tokenizer(texts, padding=True, truncation=True, max_length=N, return_tensors="pt")`.
+- **image_processor**: Callable that takes `list[PIL.Image]` and returns a batched `torch.Tensor` of pixel values.
+
+If you have a **single unified model** (like CLIP), pass the same module as both `text_model` and `vision_model`, or use the HuggingFace path which handles this automatically.
 
 ```python
+import torch
+import torch.nn as nn
+from PIL import Image
 from khoji import MultimodalEmbeddingModel, MultimodalTrainer, MultimodalTrainingConfig
 
-# Custom models must satisfy:
-#   text_model: nn.Module, forward(**tokenizer_outputs) -> object with .pooler_output or .last_hidden_state
-#   vision_model: nn.Module, forward(pixel_values) -> object with .pooler_output or .last_hidden_state
-#   image_processor: callable, list[PIL.Image] -> torch.Tensor (batched pixel values)
+# Example: custom vision encoder
+class MyVisionEncoder(nn.Module):
+    def __init__(self, hidden_dim=512):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(64, hidden_dim),
+        )
 
+    def forward(self, pixel_values, **kwargs):
+        emb = self.conv(pixel_values)
+        return type("Output", (), {"pooler_output": emb})()
+
+# Custom image preprocessor
+def my_processor(images: list[Image.Image]) -> torch.Tensor:
+    import torchvision.transforms as T
+    transform = T.Compose([T.Resize(224), T.CenterCrop(224), T.ToTensor()])
+    return torch.stack([transform(img) for img in images])
+
+# Use for inference
 model = MultimodalEmbeddingModel(
     text_model=my_text_encoder,
-    vision_model=my_vision_encoder,
+    vision_model=MyVisionEncoder(),
     tokenizer=my_tokenizer,
     image_processor=my_processor,
 )
+text_emb = model.encode_text(["a satellite image of a river"])
+img_emb = model.encode_image_sources(["river.jpg"], base_dir="./images")
 
-# Training works the same way
+# Use for training (lora=None to train full model)
 trainer = MultimodalTrainer(
     text_model=my_text_encoder,
-    vision_model=my_vision_encoder,
+    vision_model=MyVisionEncoder(),
     tokenizer=my_tokenizer,
     image_processor=my_processor,
-    config=MultimodalTrainingConfig(epochs=3, lora=None),
+    config=MultimodalTrainingConfig(
+        epochs=3,
+        lora=None,        # full fine-tuning for custom models
+        base_dir="./my_dataset",
+    ),
+)
+```
+
+You can also **override just the preprocessor** while using a HuggingFace model:
+
+```python
+# Use CLIP's text/vision encoders but with your own image preprocessing
+trainer = MultimodalTrainer(
+    "openai/clip-vit-base-patch32",
+    image_processor=my_custom_augmentation_pipeline,
+    config=MultimodalTrainingConfig(epochs=3, lora=LoRASettings(r=8, alpha=16)),
 )
 ```
 
@@ -1259,6 +1351,15 @@ trainer = MultimodalTrainer(
 | `google/siglip-base-patch16-224` | SigLIP | 768 |
 
 Any CLIP or SigLIP variant on HuggingFace should work.
+
+### Built-in multimodal datasets
+
+| Dataset | Source | Train | Test | Description |
+|---------|--------|-------|------|-------------|
+| Flickr30k | `nlphuji/flickr30k` | ~29k images | ~1k images | General-purpose image captioning. 5 captions per image. |
+| RSICD | `arampacha/rsicd` | 8,734 images | 1,093 images | Satellite/aerial imagery. Domain-specific — CLIP wasn't trained on this. Ideal for demonstrating fine-tuning gains. |
+
+Images are automatically downloaded and cached locally on first use (`~/.cache/khoji/`).
 
 ---
 
