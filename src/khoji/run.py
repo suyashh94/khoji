@@ -121,29 +121,6 @@ def run(config: ForgeConfig) -> RunResult:
     print("=" * 60)
     dataset = _load(config.data.dataset, config.data.split)
 
-    if config.data.negatives == "hard":
-        mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
-        triplets = mine_hard_negatives(
-            dataset,
-            mining_model,
-            n_negatives=config.data.n_negatives,
-            top_k=config.data.top_k,
-            n_queries=config.data.n_queries,
-            corpus_size=config.data.corpus_size,
-        )
-    else:
-        triplets = build_random_negatives(
-            dataset,
-            n_negatives=config.data.n_negatives,
-            n_queries=config.data.n_queries,
-        )
-
-    torch_ds = TripletDataset(triplets)
-
-    # --- Training ---
-    print("\n" + "=" * 60)
-    print("TRAINING")
-    print("=" * 60)
     lora_settings = None
     if config.lora is not None:
         lora_settings = LoRASettings(
@@ -153,30 +130,93 @@ def run(config: ForgeConfig) -> RunResult:
             target_modules=config.lora.target_modules,
         )
 
-    adapter_dir = str(output_dir / "adapter")
-    training_config = TrainingConfig(
-        epochs=config.train.epochs,
-        batch_size=config.train.batch_size,
-        grad_accum_steps=config.train.grad_accum_steps,
-        lr=config.train.lr,
-        weight_decay=config.train.weight_decay,
-        warmup_steps=config.train.warmup_steps,
-        max_grad_norm=config.train.max_grad_norm,
-        max_length=config.train.max_length,
-        mixed_precision=config.train.mixed_precision,
-        loss_fn=_resolve_loss(config),
-        lora=lora_settings,
-        save_dir=adapter_dir,
-        overfit_batches=config.train.overfit_batches,
-        sanity_check_samples=config.train.sanity_check_samples,
-        save_every_n_steps=config.train.save_every_n_steps,
-        keep_all_checkpoints=config.train.keep_all_checkpoints,
-        dtype=config.model.dtype,
-    )
+    rounds = config.data.mining_rounds if config.data.negatives == "hard" else 1
+    if config.data.mining_rounds > 1 and config.data.negatives != "hard":
+        print("Warning: mining_rounds > 1 has no effect when negatives is 'random'. Using 1 round.")
 
-    trainer = Trainer(config.model.name, training_config)
-    result.history = trainer.train(torch_ds)
-    result.adapter_dir = adapter_dir
+    current_adapter: str | None = config.model.adapter_path
+    final_adapter_dir = str(output_dir / "adapter")
+
+    for round_idx in range(rounds):
+        round_label = f"Round {round_idx + 1}/{rounds}" if rounds > 1 else ""
+
+        # --- Mine / build negatives ---
+        if config.data.negatives == "hard":
+            if rounds > 1:
+                print(f"\n{'=' * 60}")
+                print(f"HARD NEGATIVE MINING  {round_label}")
+                print("=" * 60)
+            mining_model = EmbeddingModel(
+                config.model.name,
+                adapter_path=current_adapter,
+                max_length=config.train.max_length,
+                dtype=config.model.dtype,
+            )
+            triplets = mine_hard_negatives(
+                dataset,
+                mining_model,
+                n_negatives=config.data.n_negatives,
+                top_k=config.data.top_k,
+                n_queries=config.data.n_queries,
+                corpus_size=config.data.corpus_size,
+            )
+            del mining_model  # free memory before training
+        else:
+            triplets = build_random_negatives(
+                dataset,
+                n_negatives=config.data.n_negatives,
+                n_queries=config.data.n_queries,
+            )
+
+        torch_ds = TripletDataset(triplets)
+
+        # --- Training ---
+        print("\n" + "=" * 60)
+        print(f"TRAINING  {round_label}".rstrip())
+        print("=" * 60)
+
+        # Intermediate rounds save to adapter_r1/, adapter_r2/, etc.
+        # Final round saves to adapter/
+        is_last_round = round_idx == rounds - 1
+        if rounds > 1 and not is_last_round:
+            adapter_dir = str(output_dir / f"adapter_r{round_idx + 1}")
+        else:
+            adapter_dir = final_adapter_dir
+
+        training_config = TrainingConfig(
+            epochs=config.train.epochs,
+            batch_size=config.train.batch_size,
+            grad_accum_steps=config.train.grad_accum_steps,
+            lr=config.train.lr,
+            weight_decay=config.train.weight_decay,
+            warmup_steps=config.train.warmup_steps,
+            max_grad_norm=config.train.max_grad_norm,
+            max_length=config.train.max_length,
+            mixed_precision=config.train.mixed_precision,
+            loss_fn=_resolve_loss(config),
+            lora=lora_settings,
+            save_dir=adapter_dir,
+            overfit_batches=config.train.overfit_batches,
+            sanity_check_samples=config.train.sanity_check_samples,
+            save_every_n_steps=config.train.save_every_n_steps,
+            keep_all_checkpoints=config.train.keep_all_checkpoints,
+            dtype=config.model.dtype,
+        )
+
+        # For round 2+, warm-start from the previous round's saved weights
+        if round_idx > 0 and config.lora is None:
+            # Full fine-tuning: load the saved model directly as the base
+            model_name = current_adapter  # type: ignore[assignment]
+        else:
+            model_name = config.model.name
+
+        warm_start = current_adapter if (round_idx > 0 and config.lora is not None) else None
+        trainer = Trainer(model_name, training_config, adapter_path=warm_start)
+        result.history = trainer.train(torch_ds)
+
+        current_adapter = adapter_dir
+
+    result.adapter_dir = final_adapter_dir
 
     # Save training history
     result.history.save(str(output_dir / "train_history.json"))

@@ -16,6 +16,7 @@ data:
   n_queries: 50            # small subset for testing. null = all queries
   corpus_size: null        # only used with hard negatives. null = full corpus
   top_k: 50                # top-k for hard negative mining
+  mining_rounds: 1         # iterative hard negative mining rounds (only used when negatives: hard)
 
 # Set to null for full fine-tuning: lora: null
 lora:
@@ -71,6 +72,7 @@ data:
   n_queries: null          # all queries
   corpus_size: null        # full corpus
   top_k: 50                # top-k for hard negative mining
+  mining_rounds: 2         # iterative hard negative mining rounds (only used when negatives: hard)
 
 # Set to null for full fine-tuning: lora: null
 lora:
@@ -125,6 +127,7 @@ data:
   n_queries: 5             # tiny subset
   corpus_size: null        # not used with random negatives
   top_k: 50                # top-k for hard negative mining
+  mining_rounds: 1         # iterative hard negative mining rounds (only used when negatives: hard)
 
 # Set to null for full fine-tuning: lora: null
 lora:

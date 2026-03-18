@@ -12,7 +12,7 @@
 
 - Parameter-efficient fine-tuning via LoRA (only adapter weights are trained and saved)
 - Multiple loss functions: Triplet Margin, InfoNCE, Contrastive
-- Hard negative mining using model embeddings
+- Hard negative mining with iterative re-mining (mine → train → re-mine with fine-tuned model)
 - Custom retrieval metrics: nDCG@k, MRR@k, Recall@k — implemented from scratch
 - Auto-detection of model pooling strategy and LoRA target modules
 - YAML-driven configuration for reproducible experiments
@@ -132,6 +132,8 @@ data:
   n_queries: null                     # Number of queries to use (null = all)
   corpus_size: null                   # Corpus size limit (null = full). Only relevant for hard negatives.
   # top_k: 50                        # Top-k corpus docs to consider for hard negative mining
+  # mining_rounds: 1                 # Iterative hard negative mining rounds (only for negatives: hard)
+                                      #   Round 2+ re-mines using the fine-tuned model from the previous round
 
 # ── LoRA ──────────────────────────────────────────────────────────
 # Set to null for full fine-tuning (all parameters trained):
@@ -204,6 +206,7 @@ output_dir: ./forge-output            # Directory for adapter weights, configs, 
 | `n_queries` | `int \| null` | `null` | Subset of queries to use. `null` = all queries in the split. Useful for quick experiments. |
 | `corpus_size` | `int \| null` | `null` | Corpus size limit for hard negative mining. Relevant docs are always included. `null` = full corpus. |
 | `top_k` | `int` | `50` | Only for `negatives: hard`. Number of top similar docs to consider when mining negatives. |
+| `mining_rounds` | `int` | `1` | Iterative hard negative mining rounds. Only used when `negatives: hard`. Round 2+ re-mines negatives using the fine-tuned model from the previous round, producing progressively harder negatives. |
 
 #### `lora`
 
@@ -286,12 +289,14 @@ If your model architecture is not listed, set `target_modules` explicitly in the
 forge-output/
   config.yaml            # Saved config for reproducibility
   train_history.json     # Training curves (step_loss, step_lr, step_grad_norm, epoch_loss)
-  adapter/               # Final LoRA adapter weights
+  adapter/               # Final LoRA adapter weights (from last mining round)
     adapter_model.safetensors
     adapter_config.json
     checkpoint-latest/   # Intermediate checkpoint (if save_every_n_steps is set)
     checkpoint-100/      # Named checkpoints (if keep_all_checkpoints: true)
     checkpoint-200/
+  adapter_r1/            # Round 1 adapter (only when mining_rounds > 1)
+  adapter_r2/            # Round 2 adapter (only when mining_rounds > 2)
   baseline.json          # Baseline eval metrics (if run_before: true)
   finetuned.json         # Fine-tuned eval metrics (if run_after: true)
 ```
@@ -506,6 +511,49 @@ doc_emb = model.encode(["Compound interest is interest calculated on the initial
 import torch
 similarity = torch.mm(query_emb, doc_emb.t())  # cosine sim (already L2-normalized)
 print(f"Similarity: {similarity.item():.4f}")
+```
+
+### Iterative hard negative mining
+
+The most effective way to improve retrieval quality. Each round mines harder negatives using the improved model from the previous round.
+
+**Via YAML** — just set `mining_rounds`:
+
+```yaml
+data:
+  negatives: hard
+  n_negatives: 3
+  mining_rounds: 2    # mine → train → re-mine with fine-tuned model → train again
+```
+
+**Via Python API** — for full control over each round:
+
+```python
+from khoji import (
+    EmbeddingModel, Trainer, TrainingConfig, TripletDataset,
+    LoRASettings, load_beir, mine_hard_negatives,
+)
+
+dataset = load_beir("fiqa", split="train")
+lora = LoRASettings(r=16, alpha=32)
+
+# Round 1: mine with base model
+base_model = EmbeddingModel("BAAI/bge-base-en-v1.5")
+triplets = mine_hard_negatives(dataset, base_model, n_negatives=3, top_k=50)
+del base_model
+
+config = TrainingConfig(epochs=5, lr=2e-5, lora=lora, save_dir="./adapter_r1")
+trainer = Trainer("BAAI/bge-base-en-v1.5", config)
+trainer.train(TripletDataset(triplets))
+
+# Round 2: mine with fine-tuned model (harder negatives)
+ft_model = EmbeddingModel("BAAI/bge-base-en-v1.5", adapter_path="./adapter_r1")
+triplets = mine_hard_negatives(dataset, ft_model, n_negatives=3, top_k=50)
+del ft_model
+
+config = TrainingConfig(epochs=5, lr=2e-5, lora=lora, save_dir="./adapter_final")
+trainer = Trainer("BAAI/bge-base-en-v1.5", config, adapter_path="./adapter_r1")
+trainer.train(TripletDataset(triplets))
 ```
 
 ### Writing a custom training script
@@ -902,8 +950,9 @@ Three configs are included for different use cases:
 - Good for testing config changes and verifying the pipeline
 
 ### `configs/fiqa_full.yaml` — Full training
-- All queries, hard negative mining (top_k=50, n_negatives=3)
-- 5 epochs, batch_size=32, InfoNCE loss
+- All queries, hard negative mining (top_k=50, n_negatives=3, mining_rounds=2)
+- 2-round iterative mining: train → re-mine harder negatives → train again
+- 5 epochs per round, batch_size=32, InfoNCE loss
 - LoRA rank=16, alpha=32
 - Full baseline + fine-tuned evaluation on all test queries
 
@@ -1027,20 +1076,25 @@ ForgeConfig.from_yaml()
 load_beir() ──> RetrievalDataset (queries, corpus, qrels)
     |
     v
-build_random_negatives() ──> list[Triplet] ──> TripletDataset
-  or mine_hard_negatives()
+┌─────────────────── mining round loop ───────────────────┐
+│                                                          │
+│  mine_hard_negatives() ──> list[Triplet] ──> TripletDS   │
+│    (uses base model in round 1,                          │
+│     fine-tuned model in round 2+)                        │
+│       |                                                  │
+│       v                                                  │
+│  Trainer.train() ──> TrainHistory + adapter saved        │
+│       |                                                  │
+│       └──── adapter feeds next round's mining ───────────┘
     |
-    v
-Trainer.train() ──> TrainHistory (loss, lr, grad norms per step)
-    |                   |
-    |                   v
-    |              LoRA adapter saved to disk
     v
 Evaluator.evaluate() ──> EvalResult (nDCG, MRR, Recall @ k)
     |
     v
 RunResult (history + baseline + finetuned + adapter_dir)
 ```
+
+For single-round runs (`mining_rounds: 1` or `negatives: random`), this loop runs once — identical to a standard pipeline.
 
 ---
 
