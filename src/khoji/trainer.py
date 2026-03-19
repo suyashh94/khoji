@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import torch
+from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -110,6 +111,7 @@ class Trainer:
         model: torch.nn.Module | None = None,
         tokenizer: object | None = None,
         pooling: str = "cls",
+        adapter_path: str | None = None,
     ):
         self.model_name = model_name or "custom"
         self.config = config or TrainingConfig()
@@ -136,7 +138,22 @@ class Trainer:
 
         # Apply LoRA (skip if lora config is None)
         if self.config.lora is not None:
-            self.model = apply_lora(base_model, self.config.lora)
+            if adapter_path is not None:
+                # Warm-start from a previously trained adapter
+                self.model = PeftModel.from_pretrained(
+                    base_model, adapter_path, is_trainable=True
+                )
+                trainable = sum(
+                    p.numel() for p in self.model.parameters() if p.requires_grad
+                )
+                total = sum(p.numel() for p in self.model.parameters())
+                print(
+                    f"LoRA warm-start from {adapter_path} | "
+                    f"trainable: {trainable:,} / {total:,} "
+                    f"({100 * trainable / total:.2f}%)"
+                )
+            else:
+                self.model = apply_lora(base_model, self.config.lora)
         else:
             self.model = base_model
 

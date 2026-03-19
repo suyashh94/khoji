@@ -37,6 +37,70 @@ def _resolve_loss(config: ForgeConfig):
         raise ValueError(f"Unknown loss: {config.train.loss}. Use 'triplet', 'infonce', or 'contrastive'.")
 
 
+def _build_triplets(
+    config: ForgeConfig,
+    dataset: "RetrievalDataset",
+    adapter_path: str | None,
+) -> list:
+    """Build training triplets using the configured negative strategy.
+
+    For hard/mixed modes, loads the mining model with the adapter (if any)
+    to mine negatives, then frees GPU memory.
+    """
+    if config.data.negatives in ("hard", "mixed"):
+        # Load mining model — handle LoRA vs full fine-tuning
+        if adapter_path is not None and config.lora is None:
+            # Full fine-tuning: saved model IS the model
+            mining_model = EmbeddingModel(
+                adapter_path,
+                max_length=config.train.max_length,
+                dtype=config.model.dtype,
+            )
+        else:
+            # LoRA or no adapter: base model + optional adapter
+            mining_model = EmbeddingModel(
+                config.model.name,
+                adapter_path=adapter_path,
+                max_length=config.train.max_length,
+                dtype=config.model.dtype,
+            )
+
+    if config.data.negatives == "hard":
+        triplets = mine_hard_negatives(
+            dataset,
+            mining_model,
+            n_negatives=config.data.n_negatives,
+            top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+        )
+    elif config.data.negatives == "mixed":
+        triplets = build_mixed_negatives(
+            dataset,
+            mining_model,
+            n_random=config.data.n_random,
+            n_hard=config.data.n_hard,
+            top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+        )
+    else:
+        return build_random_negatives(
+            dataset,
+            n_negatives=config.data.n_negatives,
+            n_queries=config.data.n_queries,
+        )
+
+    # Free mining model GPU memory
+    del mining_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return triplets
+
+
 def _set_seed(seed: int) -> None:
     """Set global random seed for reproducibility."""
     random.seed(seed)
@@ -137,51 +201,12 @@ def run(config: ForgeConfig) -> RunResult:
             raise ValueError("negatives: mixed requires n_random > 0 or n_hard > 0.")
     elif config.data.negatives in ("random", "hard"):
         if config.data.n_random != 1 or config.data.n_hard != 1:
-            print(f"Note: n_random/n_hard are ignored when negatives is '{config.data.negatives}'. "
-                  f"Using n_negatives={config.data.n_negatives} instead.")
+            print(
+                f"Note: n_random/n_hard are ignored when negatives "
+                f"is '{config.data.negatives}'. "
+                f"Using n_negatives={config.data.n_negatives} instead."
+            )
 
-    if config.data.negatives == "hard":
-        mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
-        triplets = mine_hard_negatives(
-            dataset,
-            mining_model,
-            n_negatives=config.data.n_negatives,
-            top_k=config.data.top_k,
-            n_queries=config.data.n_queries,
-            corpus_size=config.data.corpus_size,
-        )
-        del mining_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    elif config.data.negatives == "mixed":
-        mining_model = EmbeddingModel(
-            config.model.name, max_length=config.train.max_length, dtype=config.model.dtype
-        )
-        triplets = build_mixed_negatives(
-            dataset,
-            mining_model,
-            n_random=config.data.n_random,
-            n_hard=config.data.n_hard,
-            top_k=config.data.top_k,
-            n_queries=config.data.n_queries,
-            corpus_size=config.data.corpus_size,
-        )
-        del mining_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    else:
-        triplets = build_random_negatives(
-            dataset,
-            n_negatives=config.data.n_negatives,
-            n_queries=config.data.n_queries,
-        )
-
-    torch_ds = TripletDataset(triplets)
-
-    # --- Training ---
-    print("\n" + "=" * 60)
-    print("TRAINING")
-    print("=" * 60)
     lora_settings = None
     if config.lora is not None:
         lora_settings = LoRASettings(
@@ -191,30 +216,91 @@ def run(config: ForgeConfig) -> RunResult:
             target_modules=config.lora.target_modules,
         )
 
-    adapter_dir = str(output_dir / "adapter")
-    training_config = TrainingConfig(
-        epochs=config.train.epochs,
-        batch_size=config.train.batch_size,
-        grad_accum_steps=config.train.grad_accum_steps,
-        lr=config.train.lr,
-        weight_decay=config.train.weight_decay,
-        warmup_steps=config.train.warmup_steps,
-        max_grad_norm=config.train.max_grad_norm,
-        max_length=config.train.max_length,
-        mixed_precision=config.train.mixed_precision,
-        loss_fn=_resolve_loss(config),
-        lora=lora_settings,
-        save_dir=adapter_dir,
-        overfit_batches=config.train.overfit_batches,
-        sanity_check_samples=config.train.sanity_check_samples,
-        save_every_n_steps=config.train.save_every_n_steps,
-        keep_all_checkpoints=config.train.keep_all_checkpoints,
-        dtype=config.model.dtype,
-    )
+    # Mining rounds: only for hard/mixed. Random negatives don't benefit from re-mining.
+    uses_mining = config.data.negatives in ("hard", "mixed")
+    rounds = config.data.mining_rounds if uses_mining else 1
+    if config.data.mining_rounds > 1 and not uses_mining:
+        print(
+            "Note: mining_rounds > 1 has no effect with random negatives. "
+            "Using 1 round."
+        )
 
-    trainer = Trainer(config.model.name, training_config)
-    result.history = trainer.train(torch_ds)
-    result.adapter_dir = adapter_dir
+    current_adapter: str | None = config.model.adapter_path
+    final_adapter_dir = str(output_dir / "adapter")
+
+    for round_idx in range(rounds):
+        round_label = f"Round {round_idx + 1}/{rounds}" if rounds > 1 else ""
+
+        # --- Mine / build negatives ---
+        if rounds > 1:
+            print(f"\n{'=' * 60}")
+            print(f"NEGATIVE MINING  {round_label}")
+            print("=" * 60)
+
+        triplets = _build_triplets(config, dataset, current_adapter)
+        torch_ds = TripletDataset(triplets)
+
+        # --- Training ---
+        print("\n" + "=" * 60)
+        print(f"TRAINING  {round_label}".rstrip())
+        print("=" * 60)
+
+        # Intermediate rounds save to adapter_r1/, etc. Final round saves to adapter/
+        is_last_round = round_idx == rounds - 1
+        if rounds > 1 and not is_last_round:
+            adapter_dir = str(output_dir / f"adapter_r{round_idx + 1}")
+        else:
+            adapter_dir = final_adapter_dir
+
+        # Halve LR for each subsequent round to avoid overshooting
+        round_lr = config.train.lr / (2 ** round_idx)
+        if rounds > 1 and round_idx > 0:
+            print(f"LR decay: {config.train.lr} → {round_lr} (round {round_idx + 1})")
+
+        training_config = TrainingConfig(
+            epochs=config.train.epochs,
+            batch_size=config.train.batch_size,
+            grad_accum_steps=config.train.grad_accum_steps,
+            lr=round_lr,
+            weight_decay=config.train.weight_decay,
+            warmup_steps=config.train.warmup_steps,
+            max_grad_norm=config.train.max_grad_norm,
+            max_length=config.train.max_length,
+            mixed_precision=config.train.mixed_precision,
+            loss_fn=_resolve_loss(config),
+            lora=lora_settings,
+            save_dir=adapter_dir,
+            overfit_batches=config.train.overfit_batches,
+            sanity_check_samples=config.train.sanity_check_samples,
+            save_every_n_steps=config.train.save_every_n_steps,
+            keep_all_checkpoints=config.train.keep_all_checkpoints,
+            dtype=config.model.dtype,
+        )
+
+        # For round 2+ full fine-tuning, load from previous round's saved model
+        if round_idx > 0 and config.lora is None:
+            model_name = current_adapter  # type: ignore[assignment]
+        else:
+            model_name = config.model.name
+
+        # For round 2+ LoRA, warm-start from previous adapter
+        warm_start = (
+            current_adapter
+            if (round_idx > 0 and config.lora is not None)
+            else None
+        )
+        trainer = Trainer(model_name, training_config, adapter_path=warm_start)
+        round_history = trainer.train(torch_ds)
+
+        # Accumulate history across rounds
+        result.history.step_loss.extend(round_history.step_loss)
+        result.history.step_lr.extend(round_history.step_lr)
+        result.history.step_grad_norm.extend(round_history.step_grad_norm)
+        result.history.epoch_loss.extend(round_history.epoch_loss)
+
+        current_adapter = adapter_dir
+
+    result.adapter_dir = final_adapter_dir
 
     # Save training history
     result.history.save(str(output_dir / "train_history.json"))
