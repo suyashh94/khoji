@@ -71,6 +71,7 @@ def _build_triplets(
             mining_model,
             n_negatives=config.data.n_negatives,
             top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
         )
@@ -81,6 +82,7 @@ def _build_triplets(
             n_random=config.data.n_random,
             n_hard=config.data.n_hard,
             top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
         )
