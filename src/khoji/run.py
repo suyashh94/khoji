@@ -11,13 +11,18 @@ from pathlib import Path
 import torch
 
 from khoji.config import ForgeConfig
-from khoji.data import TripletDataset, build_mixed_negatives, build_random_negatives, mine_hard_negatives
+from khoji.data import (
+    TripletDataset,
+    build_mixed_negatives,
+    build_random_negatives,
+    mine_hard_negatives,
+)
 from khoji.dataset import RetrievalDataset, load_beir, load_custom
 from khoji.evaluator import EvalResult, Evaluator
 from khoji.lora import LoRASettings
 from khoji.loss import contrastive_loss, infonce_loss, triplet_margin_loss
 from khoji.model import EmbeddingModel
-from khoji.trainer import TrainHistory, Trainer, TrainingConfig
+from khoji.trainer import Trainer, TrainHistory, TrainingConfig
 
 
 def _resolve_loss(config: ForgeConfig):
@@ -149,7 +154,9 @@ def run(config: ForgeConfig) -> RunResult:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     elif config.data.negatives == "mixed":
-        mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
+        mining_model = EmbeddingModel(
+            config.model.name, max_length=config.train.max_length, dtype=config.model.dtype
+        )
         triplets = build_mixed_negatives(
             dataset,
             mining_model,

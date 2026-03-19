@@ -12,7 +12,7 @@
 
 - Parameter-efficient fine-tuning via LoRA (only adapter weights are trained and saved)
 - Multiple loss functions: Triplet Margin, InfoNCE, Contrastive
-- Hard negative mining using model embeddings
+- Negative mining strategies: random, hard, or mixed (random + hard combined)
 - Custom retrieval metrics: nDCG@k, MRR@k, Recall@k — implemented from scratch
 - Auto-detection of model pooling strategy and LoRA target modules
 - YAML-driven configuration for reproducible experiments
@@ -127,8 +127,10 @@ model:
 data:
   dataset: fiqa                       # BEIR dataset name (e.g., fiqa, scifact, nfcorpus, etc.)
   split: train                        # Dataset split: "train", "validation", or "test"
-  negatives: random                   # Negative strategy: "random" or "hard"
-  n_negatives: 1                      # Number of negatives per (query, positive) pair
+  negatives: random                   # Negative strategy: "random", "hard", or "mixed"
+  n_negatives: 1                      # Negatives per pair (used by "random" and "hard" modes)
+  # n_random: 1                      # Random negatives per pair (only for "mixed" mode)
+  # n_hard: 1                        # Hard negatives per pair (only for "mixed" mode)
   n_queries: null                     # Number of queries to use (null = all)
   corpus_size: null                   # Corpus size limit (null = full). Only relevant for hard negatives.
   # top_k: 50                        # Top-k corpus docs to consider for hard negative mining
@@ -199,11 +201,13 @@ output_dir: ./forge-output            # Directory for adapter weights, configs, 
 |-----------|------|---------|-------------|
 | `dataset` | `str` | `fiqa` | BEIR dataset name **or** path to a local dataset directory. See [Custom Datasets](#custom-datasets). |
 | `split` | `str` | `train` | Which split to build training triplets from. |
-| `negatives` | `str` | `random` | `"random"`: fast, no model needed. `"hard"`: mines negatives using model embeddings (slower, better training signal). |
-| `n_negatives` | `int` | `1` | Negatives per (query, positive) pair. Total triplets = queries x positives_per_query x n_negatives. |
+| `negatives` | `str` | `random` | `"random"`: fast, no model needed. `"hard"`: mines negatives using model embeddings (slower, better signal). `"mixed"`: both random and hard negatives combined — balanced training signal. |
+| `n_negatives` | `int` | `1` | Negatives per (query, positive) pair. Used by `random` and `hard` modes. Ignored by `mixed`. |
+| `n_random` | `int` | `1` | Random negatives per pair. Only used when `negatives: mixed`. |
+| `n_hard` | `int` | `1` | Hard negatives per pair. Only used when `negatives: mixed`. |
 | `n_queries` | `int \| null` | `null` | Subset of queries to use. `null` = all queries in the split. Useful for quick experiments. |
 | `corpus_size` | `int \| null` | `null` | Corpus size limit for hard negative mining. Relevant docs are always included. `null` = full corpus. |
-| `top_k` | `int` | `50` | Only for `negatives: hard`. Number of top similar docs to consider when mining negatives. |
+| `top_k` | `int` | `50` | Top similar docs to consider when mining hard negatives (for `hard` and `mixed` modes). |
 
 #### `lora`
 
@@ -458,6 +462,7 @@ from khoji import (
     Trainer,
     TrainingConfig,
     TripletDataset,
+    build_mixed_negatives,
     build_random_negatives,
     load_beir,
     mine_hard_negatives,
@@ -467,12 +472,18 @@ from khoji import (
 dataset = load_beir("fiqa", split="train")
 print(f"Queries: {len(dataset.queries)}, Corpus: {len(dataset.corpus)}")
 
-# 2. Build training triplets
-triplets = build_random_negatives(dataset, n_negatives=1, n_queries=100)
+# 2. Build training triplets — three strategies:
 
-# Or with hard negatives (requires encoding the corpus):
+# Option A: Random negatives (fast, no model needed)
+triplets = build_random_negatives(dataset, n_negatives=3, n_queries=100)
+
+# Option B: Hard negatives (requires encoding the corpus)
 # model = EmbeddingModel("BAAI/bge-base-en-v1.5")
 # triplets = mine_hard_negatives(dataset, model, n_negatives=3, top_k=50)
+
+# Option C: Mixed — random + hard combined (recommended)
+# model = EmbeddingModel("BAAI/bge-base-en-v1.5")
+# triplets = build_mixed_negatives(dataset, model, n_random=2, n_hard=1, top_k=50)
 
 torch_ds = TripletDataset(triplets)
 
@@ -513,7 +524,7 @@ print(f"Similarity: {similarity.item():.4f}")
 If your data doesn't come from BEIR or JSONL files, you can skip the data loading entirely and wire things up yourself. The key insight is that every component is independent:
 
 - **`RetrievalDataset`** is just three dicts — build it from any source
-- **`build_random_negatives` / `mine_hard_negatives`** take a `RetrievalDataset` and return `list[Triplet]`
+- **`build_random_negatives` / `mine_hard_negatives` / `build_mixed_negatives`** take a `RetrievalDataset` and return `list[Triplet]`
 - **`TripletDataset`** wraps triplets for PyTorch — or you can construct `Triplet` objects directly
 - **`Trainer`** takes a `TripletDataset` and returns `TrainHistory`
 - **`Evaluator.evaluate()`** accepts a `RetrievalDataset` directly via the `dataset=` parameter
@@ -529,6 +540,7 @@ from khoji import (
     Trainer,
     TrainingConfig,
     TripletDataset,
+    build_mixed_negatives,
     build_random_negatives,
     mine_hard_negatives,
     EmbeddingModel,
@@ -565,7 +577,11 @@ triplets = build_random_negatives(train_dataset, n_negatives=3)
 # base_model = EmbeddingModel("BAAI/bge-base-en-v1.5")
 # triplets = mine_hard_negatives(train_dataset, base_model, n_negatives=3, top_k=50)
 
-# Option C: Build triplets yourself if you have your own mining logic
+# Option C: Mixed — random + hard combined (recommended for balanced training)
+# base_model = EmbeddingModel("BAAI/bge-base-en-v1.5")
+# triplets = build_mixed_negatives(train_dataset, base_model, n_random=2, n_hard=1, top_k=50)
+
+# Option D: Build triplets yourself if you have your own mining logic
 # triplets = [
 #     Triplet(query="...", positive="...", negative="...")
 #     for query, pos, neg in your_custom_mining_function()
@@ -893,7 +909,7 @@ print(recall_at_k(ranked, qrel, k=3)) # 1.0
 
 ## Example Configs
 
-Three configs are included for different use cases:
+Four configs are included for different use cases:
 
 ### `configs/fiqa_quick.yaml` — Quick iteration
 - 50 training queries, random negatives
@@ -906,6 +922,12 @@ Three configs are included for different use cases:
 - 5 epochs, batch_size=32, InfoNCE loss
 - LoRA rank=16, alpha=32
 - Full baseline + fine-tuned evaluation on all test queries
+
+### `configs/fiqa_mixed.yaml` — Mixed negatives
+- All queries, 2 random + 1 hard negative per pair
+- 2 epochs, batch_size=32, InfoNCE loss
+- LoRA rank=16, alpha=32, target_modules: [query, key, value, dense]
+- Random negatives provide easy training signal, hard negatives push fine-grained ranking
 
 ### `configs/fiqa_overfit.yaml` — Debug pipeline
 - 1 batch, 50 epochs, lr=1e-3, no dropout
@@ -1027,8 +1049,9 @@ ForgeConfig.from_yaml()
 load_beir() ──> RetrievalDataset (queries, corpus, qrels)
     |
     v
-build_random_negatives() ──> list[Triplet] ──> TripletDataset
+build_random_negatives()  ──> list[Triplet] ──> TripletDataset
   or mine_hard_negatives()
+  or build_mixed_negatives()
     |
     v
 Trainer.train() ──> TrainHistory (loss, lr, grad norms per step)

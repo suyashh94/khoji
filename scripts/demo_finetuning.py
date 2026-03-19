@@ -199,7 +199,10 @@ def main():
     if args.n_random == 0 and args.n_hard == 0:
         parser.error("Need at least one of --n-random or --n-hard > 0")
 
-    experiments_to_run = list(EXPERIMENTS.keys()) if args.experiment == "both" else [args.experiment]
+    if args.experiment == "both":
+        experiments_to_run = list(EXPERIMENTS.keys())
+    else:
+        experiments_to_run = [args.experiment]
 
     for exp_name in experiments_to_run:
         exp = EXPERIMENTS[exp_name]
