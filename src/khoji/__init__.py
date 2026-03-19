@@ -3,7 +3,7 @@
 __version__ = "0.1.1"
 
 from khoji.config import ForgeConfig
-from khoji.data import Triplet, TripletDataset, build_random_negatives, mine_hard_negatives
+from khoji.data import Triplet, TripletDataset, build_mixed_negatives, build_random_negatives, mine_hard_negatives
 from khoji.dataset import RetrievalDataset, load_beir, load_custom
 from khoji.evaluator import EvalResult, Evaluator
 from khoji.lora import LoRASettings
@@ -26,6 +26,7 @@ __all__ = [
     "TrainingConfig",
     "Triplet",
     "TripletDataset",
+    "build_mixed_negatives",
     "build_random_negatives",
     "contrastive_loss",
     "infonce_loss",

@@ -19,8 +19,10 @@ class ModelConfig:
 class DataConfig:
     dataset: str = "fiqa"
     split: str = "train"
-    negatives: str = "random"  # "random" or "hard"
-    n_negatives: int = 1
+    negatives: str = "random"  # "random", "hard", or "mixed"
+    n_negatives: int = 1  # negatives per pair (used by "random" and "hard" modes)
+    n_random: int = 1  # random negatives per pair (only used when negatives: mixed)
+    n_hard: int = 1  # hard negatives per pair (only used when negatives: mixed)
     n_queries: int | None = None
     corpus_size: int | None = None
     top_k: int = 50  # for hard negative mining

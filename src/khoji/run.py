@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from khoji.config import ForgeConfig
-from khoji.data import TripletDataset, build_random_negatives, mine_hard_negatives
+from khoji.data import TripletDataset, build_mixed_negatives, build_random_negatives, mine_hard_negatives
 from khoji.dataset import RetrievalDataset, load_beir, load_custom
 from khoji.evaluator import EvalResult, Evaluator
 from khoji.lora import LoRASettings
@@ -131,6 +131,23 @@ def run(config: ForgeConfig) -> RunResult:
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
         )
+        del mining_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif config.data.negatives == "mixed":
+        mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
+        triplets = build_mixed_negatives(
+            dataset,
+            mining_model,
+            n_random=config.data.n_random,
+            n_hard=config.data.n_hard,
+            top_k=config.data.top_k,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+        )
+        del mining_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         triplets = build_random_negatives(
             dataset,
