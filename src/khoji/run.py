@@ -183,11 +183,16 @@ def run(config: ForgeConfig) -> RunResult:
         else:
             adapter_dir = final_adapter_dir
 
+        # Halve LR for each subsequent round to avoid overshooting
+        round_lr = config.train.lr / (2 ** round_idx)
+        if rounds > 1 and round_idx > 0:
+            print(f"LR decay: {config.train.lr} → {round_lr} (round {round_idx + 1})")
+
         training_config = TrainingConfig(
             epochs=config.train.epochs,
             batch_size=config.train.batch_size,
             grad_accum_steps=config.train.grad_accum_steps,
-            lr=config.train.lr,
+            lr=round_lr,
             weight_decay=config.train.weight_decay,
             warmup_steps=config.train.warmup_steps,
             max_grad_norm=config.train.max_grad_norm,
@@ -212,7 +217,13 @@ def run(config: ForgeConfig) -> RunResult:
 
         warm_start = current_adapter if (round_idx > 0 and config.lora is not None) else None
         trainer = Trainer(model_name, training_config, adapter_path=warm_start)
-        result.history = trainer.train(torch_ds)
+        round_history = trainer.train(torch_ds)
+
+        # Accumulate history across rounds
+        result.history.step_loss.extend(round_history.step_loss)
+        result.history.step_lr.extend(round_history.step_lr)
+        result.history.step_grad_norm.extend(round_history.step_grad_norm)
+        result.history.epoch_loss.extend(round_history.epoch_loss)
 
         current_adapter = adapter_dir
 
