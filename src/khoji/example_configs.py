@@ -225,4 +225,365 @@ eval:
 
 output_dir: ./forge-output/fiqa-overfit
 """,
+    # ── Multimodal (text-to-image) configs ──────────────────────
+    "flickr30k_quick.yaml": """\
+# Quick test config for text-to-image retrieval
+# Usage: khoji multimodal flickr30k_quick.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null       # path to existing adapter
+  dtype: null              # "fp16", "bf16", or null (fp32)
+  lora_target: both        # "vision", "text", or "both"
+
+data:
+  dataset: nlphuji/flickr30k
+  split: train
+  negatives: random        # "random", "hard", or "mixed"
+  n_negatives: 1
+  n_queries: 50            # small subset for testing. null = all
+  corpus_size: null        # only used with hard negatives. null = full
+  top_k: 50                # top-k for hard negative mining
+  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
+  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
+  cache_dir: null          # cache downloaded images. null = no caching
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: null     # auto-detect based on model architecture
+
+train:
+  epochs: 2
+  batch_size: 4
+  grad_accum_steps: 4      # effective batch size = 16
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 10
+  max_grad_norm: 1.0
+  max_length: 77           # CLIP default token length
+  loss: infonce            # "triplet", "infonce", or "contrastive"
+  margin: 0.2              # only for triplet loss
+  temperature: 0.05        # only for infonce loss
+  mixed_precision: null    # "fp16", "bf16", or null
+  overfit_batches: null
+  sanity_check_samples: 10
+  save_every_n_steps: null
+  keep_all_checkpoints: false
+
+# preprocess:              # optional image preprocessing overrides
+#   image_size: 224
+#   mean: [0.48145466, 0.4578275, 0.40821073]
+#   std: [0.26862954, 0.26130258, 0.27577711]
+
+seed: null
+
+eval:
+  dataset: null            # eval dataset. null = use data.dataset
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: 20
+  corpus_size: 200
+  run_before: false
+  run_after: false
+
+output_dir: ./forge-output/flickr30k-quick
+""",
+    "flickr30k_full.yaml": """\
+# Full training config for text-to-image retrieval
+# Usage: khoji multimodal flickr30k_full.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both        # "vision", "text", or "both"
+
+data:
+  dataset: nlphuji/flickr30k
+  split: train
+  negatives: hard
+  n_negatives: 3
+  n_queries: null          # all queries
+  corpus_size: null        # full corpus
+  top_k: 50
+  skip_top: 0
+  mining_rounds: 1
+  cache_dir: ./image-cache # cache downloaded images locally
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: null
+
+train:
+  epochs: 5
+  batch_size: 32
+  grad_accum_steps: 1
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: infonce
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: bf16
+  overfit_batches: null
+  sanity_check_samples: 10
+  save_every_n_steps: 200
+  keep_all_checkpoints: false
+
+seed: 42
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: null
+  corpus_size: null
+  run_before: true
+  run_after: true
+
+output_dir: ./forge-output/flickr30k-full
+""",
+    "flickr30k_overfit.yaml": """\
+# Overfit debug config for text-to-image retrieval
+# Usage: khoji multimodal flickr30k_overfit.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both
+
+data:
+  dataset: nlphuji/flickr30k
+  split: train
+  negatives: random
+  n_negatives: 1
+  n_queries: 5             # tiny subset
+  corpus_size: null
+  top_k: 50
+  skip_top: 0
+  mining_rounds: 1
+  cache_dir: null
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.0             # no dropout for overfitting
+  target_modules: null
+
+train:
+  epochs: 50
+  batch_size: 4
+  grad_accum_steps: 1      # effective batch size = 4
+  lr: 1e-3                 # high LR to overfit fast
+  weight_decay: 0.0        # no weight decay for overfitting
+  warmup_steps: 0
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: triplet
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: null
+  overfit_batches: 1       # overfit on 1 batch
+  sanity_check_samples: 10
+  save_every_n_steps: null
+  keep_all_checkpoints: false
+
+seed: 42
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: null
+  corpus_size: null
+  run_before: false        # skip eval for debug
+  run_after: false
+
+output_dir: ./forge-output/flickr30k-overfit
+""",
+    # ── RSICD (satellite imagery) configs ───────────────────────
+    "rsicd_quick.yaml": """\
+# Quick test config for text-to-image retrieval on RSICD (satellite imagery)
+# Usage: khoji multimodal rsicd_quick.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both
+
+data:
+  dataset: arampacha/rsicd
+  split: train
+  negatives: random
+  n_negatives: 1
+  n_queries: 50
+  corpus_size: null
+  top_k: 50
+  skip_top: 0
+  mining_rounds: 1
+  cache_dir: null
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: null
+
+train:
+  epochs: 2
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 10
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: infonce
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: null
+  overfit_batches: null
+  sanity_check_samples: 10
+  save_every_n_steps: null
+  keep_all_checkpoints: false
+
+seed: null
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: 20
+  corpus_size: 200
+  run_before: false
+  run_after: false
+
+output_dir: ./forge-output/rsicd-quick
+""",
+    "rsicd_full.yaml": """\
+# Full training config for text-to-image retrieval on RSICD (satellite imagery)
+# Usage: khoji multimodal rsicd_full.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both
+
+data:
+  dataset: arampacha/rsicd
+  split: train
+  negatives: hard
+  n_negatives: 3
+  n_queries: null
+  corpus_size: null
+  top_k: 50
+  skip_top: 0
+  mining_rounds: 1
+  cache_dir: null
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: null
+
+train:
+  epochs: 5
+  batch_size: 32
+  grad_accum_steps: 1
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: infonce
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: bf16
+  overfit_batches: null
+  sanity_check_samples: 10
+  save_every_n_steps: 200
+  keep_all_checkpoints: false
+
+seed: 42
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: null
+  corpus_size: null
+  run_before: true
+  run_after: true
+
+output_dir: ./forge-output/rsicd-full
+""",
+    "rsicd_overfit.yaml": """\
+# Overfit debug config for text-to-image retrieval on RSICD (satellite imagery)
+# Usage: khoji multimodal rsicd_overfit.yaml
+model:
+  name: openai/clip-vit-base-patch32
+  adapter_path: null
+  dtype: null
+  lora_target: both
+
+data:
+  dataset: arampacha/rsicd
+  split: train
+  negatives: random
+  n_negatives: 1
+  n_queries: 5
+  corpus_size: null
+  top_k: 50
+  skip_top: 0
+  mining_rounds: 1
+  cache_dir: null
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.0
+  target_modules: null
+
+train:
+  epochs: 50
+  batch_size: 4
+  grad_accum_steps: 1
+  lr: 1e-3
+  weight_decay: 0.0
+  warmup_steps: 0
+  max_grad_norm: 1.0
+  max_length: 77
+  loss: triplet
+  margin: 0.2
+  temperature: 0.05
+  mixed_precision: null
+  overfit_batches: 1
+  sanity_check_samples: 10
+  save_every_n_steps: null
+  keep_all_checkpoints: false
+
+seed: 42
+
+eval:
+  dataset: null
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: null
+  corpus_size: null
+  run_before: false
+  run_after: false
+
+output_dir: ./forge-output/rsicd-overfit
+""",
 }

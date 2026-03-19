@@ -19,7 +19,24 @@ from khoji.model import EmbeddingModel
 from khoji.run import RunResult, run
 from khoji.trainer import Trainer, TrainHistory, TrainingConfig
 
+# Multimodal (text-to-image)
+from khoji.multimodal_config import MultimodalForgeConfig
+from khoji.multimodal_data import (
+    MultimodalTriplet,
+    MultimodalTripletDataset,
+    build_mixed_negatives_multimodal,
+    build_random_negatives_multimodal,
+    mine_hard_negatives_multimodal,
+)
+from khoji.multimodal_dataset import MultimodalRetrievalDataset, load_flickr30k, load_rsicd, load_custom_multimodal
+from khoji.multimodal_evaluator import MultimodalEvaluator
+from khoji.multimodal_model import MultimodalEmbeddingModel
+from khoji.multimodal_run import run_multimodal
+from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
+from khoji.image_utils import load_image, load_images_batch
+
 __all__ = [
+    # Text-text
     "EmbeddingModel",
     "EvalResult",
     "Evaluator",
@@ -44,4 +61,22 @@ __all__ = [
     "recall_at_k",
     "run",
     "triplet_margin_loss",
+    # Multimodal (text-to-image)
+    "MultimodalEmbeddingModel",
+    "MultimodalEvaluator",
+    "MultimodalForgeConfig",
+    "MultimodalRetrievalDataset",
+    "MultimodalTrainer",
+    "MultimodalTrainingConfig",
+    "MultimodalTriplet",
+    "MultimodalTripletDataset",
+    "build_mixed_negatives_multimodal",
+    "build_random_negatives_multimodal",
+    "load_custom_multimodal",
+    "load_flickr30k",
+    "load_rsicd",
+    "load_image",
+    "load_images_batch",
+    "mine_hard_negatives_multimodal",
+    "run_multimodal",
 ]
