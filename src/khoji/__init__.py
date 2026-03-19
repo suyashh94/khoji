@@ -1,6 +1,6 @@
 """khoji: Fine-tune embedding models for domain-specific retrieval."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 from khoji.config import ForgeConfig
 from khoji.data import (
