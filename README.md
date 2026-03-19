@@ -134,6 +134,8 @@ data:
   n_queries: null                     # Number of queries to use (null = all)
   corpus_size: null                   # Corpus size limit (null = full). Only relevant for hard negatives.
   # top_k: 50                        # Top-k corpus docs to consider for hard negative mining
+  # mining_rounds: 1                 # Iterative mining rounds (hard/mixed only)
+                                      #   Round 2+ re-mines using the fine-tuned model
 
 # ── LoRA ──────────────────────────────────────────────────────────
 # Set to null for full fine-tuning (all parameters trained):
@@ -208,6 +210,7 @@ output_dir: ./forge-output            # Directory for adapter weights, configs, 
 | `n_queries` | `int \| null` | `null` | Subset of queries to use. `null` = all queries in the split. Useful for quick experiments. |
 | `corpus_size` | `int \| null` | `null` | Corpus size limit for hard negative mining. Relevant docs are always included. `null` = full corpus. |
 | `top_k` | `int` | `50` | Top similar docs to consider when mining hard negatives (for `hard` and `mixed` modes). |
+| `mining_rounds` | `int` | `1` | Iterative mining rounds (for `hard` and `mixed` modes). Round 2+ re-mines negatives using the fine-tuned model from the previous round. LR is halved each round. |
 
 #### `lora`
 
@@ -290,12 +293,14 @@ If your model architecture is not listed, set `target_modules` explicitly in the
 forge-output/
   config.yaml            # Saved config for reproducibility
   train_history.json     # Training curves (step_loss, step_lr, step_grad_norm, epoch_loss)
-  adapter/               # Final LoRA adapter weights
+  adapter/               # Final LoRA adapter weights (from last mining round)
     adapter_model.safetensors
     adapter_config.json
     checkpoint-latest/   # Intermediate checkpoint (if save_every_n_steps is set)
     checkpoint-100/      # Named checkpoints (if keep_all_checkpoints: true)
     checkpoint-200/
+  adapter_r1/            # Round 1 adapter (only when mining_rounds > 1)
+  adapter_r2/            # Round 2 adapter (only when mining_rounds > 2)
   baseline.json          # Baseline eval metrics (if run_before: true)
   finetuned.json         # Fine-tuned eval metrics (if run_after: true)
 ```
@@ -1049,15 +1054,18 @@ ForgeConfig.from_yaml()
 load_beir() ──> RetrievalDataset (queries, corpus, qrels)
     |
     v
-build_random_negatives()  ──> list[Triplet] ──> TripletDataset
-  or mine_hard_negatives()
-  or build_mixed_negatives()
+┌─────────────────── mining round loop ───────────────────┐
+│                                                          │
+│  build_random_negatives()   ──> list[Triplet]            │
+│    or mine_hard_negatives()                              │
+│    or build_mixed_negatives()                            │
+│    (round 2+ uses fine-tuned model for mining)           │
+│       |                                                  │
+│       v                                                  │
+│  Trainer.train() ──> TrainHistory + adapter saved        │
+│       |                                                  │
+│       └──── adapter feeds next round's mining ───────────┘
     |
-    v
-Trainer.train() ──> TrainHistory (loss, lr, grad norms per step)
-    |                   |
-    |                   v
-    |              LoRA adapter saved to disk
     v
 Evaluator.evaluate() ──> EvalResult (nDCG, MRR, Recall @ k)
     |

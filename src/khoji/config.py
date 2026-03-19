@@ -26,6 +26,7 @@ class DataConfig:
     n_queries: int | None = None
     corpus_size: int | None = None
     top_k: int = 50  # for hard negative mining
+    mining_rounds: int = 1  # iterative mining rounds (hard/mixed only)
 
 
 @dataclass

@@ -12,6 +12,7 @@ data:
   n_queries: null
   corpus_size: null
   top_k: 50
+  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
 
 lora:
   r: 16

@@ -71,6 +71,7 @@ data:
   n_queries: null          # all queries
   corpus_size: null        # full corpus
   top_k: 50                # top-k for hard negative mining
+  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
 
 # Set to null for full fine-tuning: lora: null
 lora:
@@ -126,6 +127,7 @@ data:
   n_queries: null          # all queries
   corpus_size: null        # full corpus
   top_k: 50                # top-k for hard negative mining
+  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
 
 # Set to null for full fine-tuning: lora: null
 lora:
