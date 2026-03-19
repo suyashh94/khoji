@@ -126,6 +126,7 @@ def mine_hard_negatives_multimodal(
     model,  # MultimodalEmbeddingModel
     n_negatives: int = 1,
     top_k: int = 50,
+    skip_top: int = 0,
     batch_size: int = 64,
     n_queries: int | None = None,
     corpus_size: int | None = None,
@@ -141,6 +142,7 @@ def mine_hard_negatives_multimodal(
         model: MultimodalEmbeddingModel for encoding.
         n_negatives: Number of hard negatives per (query, positive_image) pair.
         top_k: Top-k corpus images to consider for mining.
+        skip_top: Skip top N non-relevant images before picking negatives.
         batch_size: Batch size for encoding.
         n_queries: Number of queries to use. None = all.
         corpus_size: Corpus size limit. None = all.
@@ -169,6 +171,14 @@ def mine_hard_negatives_multimodal(
     print(f"Encoding {len(query_texts)} queries for negative mining...")
     query_embeddings = model.encode_text(query_texts, batch_size=batch_size)
 
+    fetch_k = top_k + skip_top
+
+    if skip_top > 0:
+        print(
+            f"Hard negative mining: skipping top {skip_top}, "
+            f"picking from ranks {skip_top + 1}-{fetch_k}"
+        )
+
     triplets: list[MultimodalTriplet] = []
 
     for qi, qid in enumerate(query_ids):
@@ -179,17 +189,20 @@ def mine_hard_negatives_multimodal(
         qrel = dataset.qrels[qid]
         relevant_ids = set(qrel.keys())
 
-        # Get top-k similar corpus images
+        # Get top-(k + skip_top) similar corpus images
         query_emb = query_embeddings[qi].unsqueeze(0)
         scores = torch.mm(query_emb, corpus_embeddings.t()).squeeze(0)
-        topk_indices = torch.topk(scores, min(top_k, len(corpus_ids))).indices.tolist()
+        topk_indices = torch.topk(
+            scores, min(fetch_k, len(corpus_ids))
+        ).indices.tolist()
 
-        # Filter to hard negatives (high similarity but not relevant)
+        # Filter to non-relevant, then skip top N
         hard_neg_ids = [
             corpus_ids[idx]
             for idx in topk_indices
             if corpus_ids[idx] not in relevant_ids
         ]
+        hard_neg_ids = hard_neg_ids[skip_top:]
 
         if not hard_neg_ids:
             all_non_relevant = [cid for cid in corpus_ids if cid not in relevant_ids]
@@ -204,7 +217,9 @@ def mine_hard_negatives_multimodal(
             for neg_id in hard_neg_ids[:n_negatives]:
                 neg_source = dataset.corpus[neg_id]
                 triplets.append(
-                    MultimodalTriplet(query=query_text, positive=pos_source, negative=neg_source)
+                    MultimodalTriplet(
+                        query=query_text, positive=pos_source, negative=neg_source
+                    )
                 )
 
     print(
@@ -212,3 +227,62 @@ def mine_hard_negatives_multimodal(
         f"({len(query_ids)} queries, {n_negatives} negatives each)"
     )
     return triplets
+
+
+def build_mixed_negatives_multimodal(
+    dataset: MultimodalRetrievalDataset,
+    model,  # MultimodalEmbeddingModel
+    n_random: int = 1,
+    n_hard: int = 1,
+    top_k: int = 50,
+    skip_top: int = 0,
+    batch_size: int = 64,
+    n_queries: int | None = None,
+    corpus_size: int | None = None,
+    cache_dir: str | None = None,
+    seed: int = 42,
+) -> list[MultimodalTriplet]:
+    """Build multimodal triplets with a mix of random and hard negatives.
+
+    Args:
+        dataset: MultimodalRetrievalDataset.
+        model: MultimodalEmbeddingModel for hard negative mining.
+        n_random: Number of random negatives per pair.
+        n_hard: Number of hard negatives per pair.
+        top_k: Top-k for hard negative mining.
+        skip_top: Skip top N non-relevant images.
+        batch_size: Batch size for encoding.
+        n_queries: Number of queries. None = all.
+        corpus_size: Corpus size limit. None = all.
+        cache_dir: Image cache directory.
+        seed: Random seed.
+
+    Returns:
+        List of MultimodalTriplet — both random and hard.
+    """
+    hard_triplets = mine_hard_negatives_multimodal(
+        dataset, model,
+        n_negatives=n_hard,
+        top_k=top_k,
+        skip_top=skip_top,
+        batch_size=batch_size,
+        n_queries=n_queries,
+        corpus_size=corpus_size,
+        cache_dir=cache_dir,
+    )
+
+    random_triplets = build_random_negatives_multimodal(
+        dataset,
+        n_negatives=n_random,
+        n_queries=n_queries,
+        seed=seed,
+    )
+
+    combined = hard_triplets + random_triplets
+    random.Random(seed).shuffle(combined)
+
+    print(
+        f"Mixed negatives: {len(hard_triplets)} hard + "
+        f"{len(random_triplets)} random = {len(combined)} total"
+    )
+    return combined

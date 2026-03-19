@@ -238,11 +238,13 @@ model:
 data:
   dataset: nlphuji/flickr30k
   split: train
-  negatives: random        # "random" or "hard"
+  negatives: random        # "random", "hard", or "mixed"
   n_negatives: 1
   n_queries: 50            # small subset for testing. null = all
   corpus_size: null        # only used with hard negatives. null = full
   top_k: 50                # top-k for hard negative mining
+  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
+  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
   cache_dir: null          # cache downloaded images. null = no caching
 
 # Set to null for full fine-tuning: lora: null
@@ -305,6 +307,8 @@ data:
   n_queries: null          # all queries
   corpus_size: null        # full corpus
   top_k: 50
+  skip_top: 0
+  mining_rounds: 1
   cache_dir: ./image-cache # cache downloaded images locally
 
 # Set to null for full fine-tuning: lora: null
@@ -362,6 +366,8 @@ data:
   n_queries: 5             # tiny subset
   corpus_size: null
   top_k: 50
+  skip_top: 0
+  mining_rounds: 1
   cache_dir: null
 
 # Set to null for full fine-tuning: lora: null
@@ -420,6 +426,8 @@ data:
   n_queries: 50
   corpus_size: null
   top_k: 50
+  skip_top: 0
+  mining_rounds: 1
   cache_dir: null
 
 # Set to null for full fine-tuning: lora: null
@@ -477,6 +485,8 @@ data:
   n_queries: null
   corpus_size: null
   top_k: 50
+  skip_top: 0
+  mining_rounds: 1
   cache_dir: null
 
 # Set to null for full fine-tuning: lora: null
@@ -534,6 +544,8 @@ data:
   n_queries: 5
   corpus_size: null
   top_k: 50
+  skip_top: 0
+  mining_rounds: 1
   cache_dir: null
 
 # Set to null for full fine-tuning: lora: null

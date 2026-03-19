@@ -8,10 +8,12 @@ from pathlib import Path
 
 import torch
 
+from khoji.lora import LoRASettings
 from khoji.loss import contrastive_loss, infonce_loss, triplet_margin_loss
 from khoji.multimodal_config import MultimodalForgeConfig
 from khoji.multimodal_data import (
     MultimodalTripletDataset,
+    build_mixed_negatives_multimodal,
     build_random_negatives_multimodal,
     mine_hard_negatives_multimodal,
 )
@@ -24,7 +26,6 @@ from khoji.multimodal_dataset import (
 from khoji.multimodal_evaluator import MultimodalEvaluator
 from khoji.multimodal_model import MultimodalEmbeddingModel
 from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
-from khoji.lora import LoRASettings
 from khoji.run import RunResult, _set_seed
 from khoji.trainer import TrainHistory
 
@@ -42,6 +43,57 @@ def _resolve_loss(config: MultimodalForgeConfig):
             f"Unknown loss: {config.train.loss}. "
             "Use 'triplet', 'infonce', or 'contrastive'."
         )
+
+
+def _build_triplets_multimodal(
+    config: MultimodalForgeConfig,
+    dataset: MultimodalRetrievalDataset,
+    adapter_path: str | None,
+) -> list:
+    """Build multimodal triplets using the configured negative strategy."""
+    if config.data.negatives in ("hard", "mixed"):
+        mining_model = MultimodalEmbeddingModel(
+            config.model.name,
+            adapter_path=adapter_path,
+            max_length=config.train.max_length,
+            dtype=config.model.dtype,
+        )
+
+    if config.data.negatives == "hard":
+        triplets = mine_hard_negatives_multimodal(
+            dataset,
+            mining_model,
+            n_negatives=config.data.n_negatives,
+            top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+            cache_dir=config.data.cache_dir,
+        )
+    elif config.data.negatives == "mixed":
+        triplets = build_mixed_negatives_multimodal(
+            dataset,
+            mining_model,
+            n_random=config.data.n_random,
+            n_hard=config.data.n_hard,
+            top_k=config.data.top_k,
+            skip_top=config.data.skip_top,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+            cache_dir=config.data.cache_dir,
+        )
+    else:
+        return build_random_negatives_multimodal(
+            dataset,
+            n_negatives=config.data.n_negatives,
+            n_queries=config.data.n_queries,
+        )
+
+    del mining_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return triplets
 
 
 def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
@@ -70,7 +122,6 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
             return load_rsicd(split=split, cache_dir=config.data.cache_dir)
         if "flickr" in source.lower():
             return load_flickr30k(split=split, cache_dir=config.data.cache_dir)
-        # Default: try as a generic HF dataset name
         return load_flickr30k(split=split, cache_dir=config.data.cache_dir)
 
     eval_source = config.eval.dataset or config.data.dataset
@@ -104,34 +155,11 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
     print("=" * 60)
     dataset = _load(config.data.dataset, config.data.split)
 
-    if config.data.negatives == "hard":
-        mining_model = MultimodalEmbeddingModel(
-            config.model.name,
-            max_length=config.train.max_length,
-            dtype=config.model.dtype,
+    if config.data.negatives not in ("random", "hard", "mixed"):
+        raise ValueError(
+            f"Unknown negatives mode: {config.data.negatives!r}. "
+            "Use 'random', 'hard', or 'mixed'."
         )
-        triplets = mine_hard_negatives_multimodal(
-            dataset,
-            mining_model,
-            n_negatives=config.data.n_negatives,
-            top_k=config.data.top_k,
-            n_queries=config.data.n_queries,
-            corpus_size=config.data.corpus_size,
-            cache_dir=config.data.cache_dir,
-        )
-    else:
-        triplets = build_random_negatives_multimodal(
-            dataset,
-            n_negatives=config.data.n_negatives,
-            n_queries=config.data.n_queries,
-        )
-
-    torch_ds = MultimodalTripletDataset(triplets)
-
-    # --- Training ---
-    print("\n" + "=" * 60)
-    print("TRAINING")
-    print("=" * 60)
 
     lora_settings = None
     if config.lora is not None:
@@ -142,8 +170,6 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
             target_modules=config.lora.target_modules,
         )
 
-    adapter_dir = str(output_dir / "adapter")
-
     # Build preprocess overrides dict
     preprocess_overrides = None
     if config.preprocess is not None:
@@ -153,36 +179,91 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
             "std": config.preprocess.std,
         }
 
-    training_config = MultimodalTrainingConfig(
-        epochs=config.train.epochs,
-        batch_size=config.train.batch_size,
-        grad_accum_steps=config.train.grad_accum_steps,
-        lr=config.train.lr,
-        weight_decay=config.train.weight_decay,
-        warmup_steps=config.train.warmup_steps,
-        max_grad_norm=config.train.max_grad_norm,
-        max_length=config.train.max_length,
-        mixed_precision=config.train.mixed_precision,
-        loss_fn=_resolve_loss(config),
-        lora=lora_settings,
-        lora_target=config.model.lora_target,
-        save_dir=adapter_dir,
-        overfit_batches=config.train.overfit_batches,
-        sanity_check_samples=config.train.sanity_check_samples,
-        save_every_n_steps=config.train.save_every_n_steps,
-        keep_all_checkpoints=config.train.keep_all_checkpoints,
-        dtype=config.model.dtype,
-        cache_dir=config.data.cache_dir,
-        base_dir=dataset.base_dir,
-    )
+    # Mining rounds
+    uses_mining = config.data.negatives in ("hard", "mixed")
+    rounds = config.data.mining_rounds if uses_mining else 1
+    if config.data.mining_rounds > 1 and not uses_mining:
+        print(
+            "Note: mining_rounds > 1 has no effect with random negatives. "
+            "Using 1 round."
+        )
 
-    trainer = MultimodalTrainer(
-        config.model.name,
-        training_config,
-        preprocess_overrides=preprocess_overrides,
-    )
-    result.history = trainer.train(torch_ds)
-    result.adapter_dir = adapter_dir
+    current_adapter: str | None = config.model.adapter_path
+    final_adapter_dir = str(output_dir / "adapter")
+
+    for round_idx in range(rounds):
+        round_label = f"Round {round_idx + 1}/{rounds}" if rounds > 1 else ""
+
+        if rounds > 1:
+            print(f"\n{'=' * 60}")
+            print(f"NEGATIVE MINING  {round_label}")
+            print("=" * 60)
+
+        triplets = _build_triplets_multimodal(config, dataset, current_adapter)
+        torch_ds = MultimodalTripletDataset(triplets)
+
+        # --- Training ---
+        print("\n" + "=" * 60)
+        print(f"TRAINING  {round_label}".rstrip())
+        print("=" * 60)
+
+        is_last_round = round_idx == rounds - 1
+        if rounds > 1 and not is_last_round:
+            adapter_dir = str(output_dir / f"adapter_r{round_idx + 1}")
+        else:
+            adapter_dir = final_adapter_dir
+
+        # Halve LR for each subsequent round
+        round_lr = config.train.lr / (2 ** round_idx)
+        if rounds > 1 and round_idx > 0:
+            print(f"LR decay: {config.train.lr} → {round_lr} (round {round_idx + 1})")
+
+        training_config = MultimodalTrainingConfig(
+            epochs=config.train.epochs,
+            batch_size=config.train.batch_size,
+            grad_accum_steps=config.train.grad_accum_steps,
+            lr=round_lr,
+            weight_decay=config.train.weight_decay,
+            warmup_steps=config.train.warmup_steps,
+            max_grad_norm=config.train.max_grad_norm,
+            max_length=config.train.max_length,
+            mixed_precision=config.train.mixed_precision,
+            loss_fn=_resolve_loss(config),
+            lora=lora_settings,
+            lora_target=config.model.lora_target,
+            save_dir=adapter_dir,
+            overfit_batches=config.train.overfit_batches,
+            sanity_check_samples=config.train.sanity_check_samples,
+            save_every_n_steps=config.train.save_every_n_steps,
+            keep_all_checkpoints=config.train.keep_all_checkpoints,
+            dtype=config.model.dtype,
+            cache_dir=config.data.cache_dir,
+            base_dir=dataset.base_dir,
+        )
+
+        # For round 2+ LoRA, warm-start from previous adapter
+        warm_start = (
+            current_adapter
+            if (round_idx > 0 and config.lora is not None)
+            else None
+        )
+        trainer = MultimodalTrainer(
+            config.model.name,
+            training_config,
+            preprocess_overrides=preprocess_overrides,
+            adapter_path=warm_start,
+        )
+        round_history = trainer.train(torch_ds)
+
+        # Accumulate history across rounds
+        result.history.step_loss.extend(round_history.step_loss)
+        result.history.step_lr.extend(round_history.step_lr)
+        result.history.step_grad_norm.extend(round_history.step_grad_norm)
+        result.history.epoch_loss.extend(round_history.epoch_loss)
+
+        current_adapter = adapter_dir
+
+    result.adapter_dir = final_adapter_dir
 
     # Save training history
     result.history.save(str(output_dir / "train_history.json"))
@@ -195,7 +276,7 @@ def run_multimodal(config: MultimodalForgeConfig) -> RunResult:
         eval_dataset = _load(eval_source, config.eval.split)
         finetuned_evaluator = MultimodalEvaluator(
             config.model.name,
-            adapter_path=adapter_dir,
+            adapter_path=final_adapter_dir,
             max_length=config.train.max_length,
             dtype=config.model.dtype,
         )

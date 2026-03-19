@@ -78,6 +78,7 @@ class MultimodalTrainer:
         tokenizer: object | None = None,
         image_processor: Callable | None = None,
         preprocess_overrides: dict | None = None,
+        adapter_path: str | None = None,
     ):
         self.model_name = model_name or "custom"
         self.config = config or MultimodalTrainingConfig()
@@ -104,8 +105,8 @@ class MultimodalTrainer:
         else:
             raise ValueError("Provide either model_name or (text_model + vision_model).")
 
-        # Apply LoRA
-        self._apply_lora()
+        # Apply LoRA (or warm-start from previous adapter)
+        self._apply_lora(adapter_path=adapter_path)
 
         # Mixed precision setup
         self.amp_dtype = None
@@ -165,7 +166,7 @@ class MultimodalTrainer:
         dtype_str = f" | dtype: {self.config.dtype}" if self.config.dtype else ""
         print(f"Loaded {model_name} | type: {model_type} | device: {self.device}{dtype_str}")
 
-    def _apply_lora(self) -> None:
+    def _apply_lora(self, adapter_path: str | None = None) -> None:
         """Apply LoRA to the full model targeting text/vision/both encoders."""
         if self.config.lora is None:
             return
@@ -177,6 +178,24 @@ class MultimodalTrainer:
                 self.text_encoder = apply_lora(self.text_encoder, self.config.lora)
             if target in ("vision", "both"):
                 self.vision_encoder = apply_lora(self.vision_encoder, self.config.lora)
+            return
+
+        if adapter_path is not None:
+            # Warm-start from a previously trained adapter
+            from peft import PeftModel
+
+            self._full_model = PeftModel.from_pretrained(
+                self._full_model, adapter_path, is_trainable=True
+            )
+            trainable = sum(
+                p.numel() for p in self._full_model.parameters() if p.requires_grad
+            )
+            total = sum(p.numel() for p in self._full_model.parameters())
+            print(
+                f"LoRA warm-start from {adapter_path} | "
+                f"trainable: {trainable:,} / {total:,} "
+                f"({100 * trainable / total:.2f}%)"
+            )
             return
 
         # HuggingFace models: apply LoRA to the full model, then freeze

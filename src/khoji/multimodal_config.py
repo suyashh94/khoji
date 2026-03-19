@@ -47,11 +47,15 @@ class MultimodalDataConfig:
 
     dataset: str = "nlphuji/flickr30k"
     split: str = "train"
-    negatives: str = "random"
-    n_negatives: int = 1
+    negatives: str = "random"  # "random", "hard", or "mixed"
+    n_negatives: int = 1  # negatives per pair (random/hard modes)
+    n_random: int = 1  # random negatives per pair (mixed mode only)
+    n_hard: int = 1  # hard negatives per pair (mixed mode only)
     n_queries: int | None = None
     corpus_size: int | None = None
     top_k: int = 50
+    skip_top: int = 0  # skip top N non-relevant docs (avoids false negatives)
+    mining_rounds: int = 1  # iterative mining rounds (hard/mixed only)
     cache_dir: str | None = None
 
 
