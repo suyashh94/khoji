@@ -162,6 +162,64 @@ def mine_hard_negatives(
     return triplets
 
 
+def build_mixed_negatives(
+    dataset: RetrievalDataset,
+    model: EmbeddingModel,
+    n_random: int = 1,
+    n_hard: int = 1,
+    top_k: int = 50,
+    batch_size: int = 64,
+    n_queries: int | None = None,
+    corpus_size: int | None = None,
+    seed: int = 42,
+) -> list[Triplet]:
+    """Build training triplets with a mix of random and hard negatives.
+
+    For each (query, positive) pair, creates triplets with both random negatives
+    (easy) and hard negatives (mined from model). This provides a curriculum-like
+    signal: random negatives teach basic discrimination, hard negatives push for
+    fine-grained ranking.
+
+    Args:
+        dataset: RetrievalDataset with queries, corpus, and qrels.
+        model: Embedding model to use for hard negative mining.
+        n_random: Number of random negatives per (query, positive) pair.
+        n_hard: Number of hard negatives per (query, positive) pair.
+        top_k: Top-k docs to consider for hard negative mining.
+        batch_size: Batch size for encoding.
+        n_queries: Number of queries to use. None = all.
+        corpus_size: Corpus size for hard negative mining. None = full.
+        seed: Random seed for random negative selection.
+
+    Returns:
+        List of Triplet(query, positive, negative) — contains both random and hard triplets.
+    """
+    # Mine hard negatives
+    hard_triplets = mine_hard_negatives(
+        dataset, model,
+        n_negatives=n_hard,
+        top_k=top_k,
+        batch_size=batch_size,
+        n_queries=n_queries,
+        corpus_size=corpus_size,
+    )
+
+    # Build random negatives for the same queries
+    random_triplets = build_random_negatives(
+        dataset,
+        n_negatives=n_random,
+        n_queries=n_queries,
+        seed=seed,
+    )
+
+    combined = hard_triplets + random_triplets
+    random.Random(seed).shuffle(combined)
+
+    print(f"Mixed negatives: {len(hard_triplets)} hard + {len(random_triplets)} random "
+          f"= {len(combined)} total triplets")
+    return combined
+
+
 def build_random_negatives(
     dataset: RetrievalDataset,
     n_negatives: int = 1,

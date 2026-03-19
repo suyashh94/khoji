@@ -11,7 +11,7 @@ model:
 data:
   dataset: fiqa
   split: train
-  negatives: random        # "random" or "hard"
+  negatives: random        # "random", "hard", or "mixed"
   n_negatives: 1
   n_queries: 50            # small subset for testing. null = all queries
   corpus_size: null        # only used with hard negatives. null = full corpus
@@ -66,7 +66,7 @@ model:
 data:
   dataset: fiqa
   split: train
-  negatives: hard          # "random" or "hard"
+  negatives: hard          # "random", "hard", or "mixed"
   n_negatives: 3
   n_queries: null          # all queries
   corpus_size: null        # full corpus
@@ -110,6 +110,61 @@ eval:
 
 output_dir: ./forge-output/fiqa-full
 """,
+    "fiqa_mixed.yaml": """\
+# Mixed negatives config — random (easy) + hard (challenging) for balanced training
+model:
+  name: BAAI/bge-base-en-v1.5
+  adapter_path: null       # path to existing adapter (for continued training)
+  dtype: null              # "fp16", "bf16", or null (fp32). Load base model in this precision
+
+data:
+  dataset: fiqa
+  split: train
+  negatives: mixed         # "random", "hard", or "mixed"
+  n_random: 2              # random negatives per (query, positive) pair
+  n_hard: 1                # hard negatives per (query, positive) pair
+  n_queries: null          # all queries
+  corpus_size: null        # full corpus
+  top_k: 50                # top-k for hard negative mining
+
+# Set to null for full fine-tuning: lora: null
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: null     # auto-detect based on model architecture
+
+train:
+  epochs: 2
+  batch_size: 32
+  grad_accum_steps: 1      # effective batch size = 32
+  lr: 2e-5
+  weight_decay: 0.01       # AdamW weight decay
+  warmup_steps: 100
+  max_grad_norm: 1.0       # gradient clipping. null = disabled
+  max_length: 512
+  loss: infonce            # "triplet", "infonce", or "contrastive"
+  margin: 0.2              # only for triplet loss
+  temperature: 0.05        # only for infonce loss
+  mixed_precision: bf16    # "fp16", "bf16", or null (disabled)
+  overfit_batches: null    # set to 1 to overfit on 1 batch for debugging
+  sanity_check_samples: 10 # check N training samples before/after training
+  save_every_n_steps: null # disabled
+  keep_all_checkpoints: false
+
+seed: 42                   # global seed for reproducibility
+
+eval:
+  dataset: null            # eval dataset (BEIR name or local path). null = use data.dataset
+  k_values: [1, 5, 10]
+  split: test
+  n_queries: null          # all test queries
+  corpus_size: null        # full corpus
+  run_before: true         # evaluate baseline before training
+  run_after: true          # evaluate after training
+
+output_dir: ./forge-output/fiqa-mixed
+""",
     "fiqa_overfit.yaml": """\
 # Overfit debug config — verify training pipeline works
 model:
@@ -120,7 +175,7 @@ model:
 data:
   dataset: fiqa
   split: train
-  negatives: random        # "random" or "hard"
+  negatives: random        # "random", "hard", or "mixed"
   n_negatives: 1
   n_queries: 5             # tiny subset
   corpus_size: null        # not used with random negatives

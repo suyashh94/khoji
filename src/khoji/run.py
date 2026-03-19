@@ -11,13 +11,18 @@ from pathlib import Path
 import torch
 
 from khoji.config import ForgeConfig
-from khoji.data import TripletDataset, build_random_negatives, mine_hard_negatives
+from khoji.data import (
+    TripletDataset,
+    build_mixed_negatives,
+    build_random_negatives,
+    mine_hard_negatives,
+)
 from khoji.dataset import RetrievalDataset, load_beir, load_custom
 from khoji.evaluator import EvalResult, Evaluator
 from khoji.lora import LoRASettings
 from khoji.loss import contrastive_loss, infonce_loss, triplet_margin_loss
 from khoji.model import EmbeddingModel
-from khoji.trainer import TrainHistory, Trainer, TrainingConfig
+from khoji.trainer import Trainer, TrainHistory, TrainingConfig
 
 
 def _resolve_loss(config: ForgeConfig):
@@ -121,6 +126,20 @@ def run(config: ForgeConfig) -> RunResult:
     print("=" * 60)
     dataset = _load(config.data.dataset, config.data.split)
 
+    if config.data.negatives not in ("random", "hard", "mixed"):
+        raise ValueError(
+            f"Unknown negatives mode: {config.data.negatives!r}. "
+            "Use 'random', 'hard', or 'mixed'."
+        )
+
+    if config.data.negatives == "mixed":
+        if config.data.n_random == 0 and config.data.n_hard == 0:
+            raise ValueError("negatives: mixed requires n_random > 0 or n_hard > 0.")
+    elif config.data.negatives in ("random", "hard"):
+        if config.data.n_random != 1 or config.data.n_hard != 1:
+            print(f"Note: n_random/n_hard are ignored when negatives is '{config.data.negatives}'. "
+                  f"Using n_negatives={config.data.n_negatives} instead.")
+
     if config.data.negatives == "hard":
         mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
         triplets = mine_hard_negatives(
@@ -131,6 +150,25 @@ def run(config: ForgeConfig) -> RunResult:
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
         )
+        del mining_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif config.data.negatives == "mixed":
+        mining_model = EmbeddingModel(
+            config.model.name, max_length=config.train.max_length, dtype=config.model.dtype
+        )
+        triplets = build_mixed_negatives(
+            dataset,
+            mining_model,
+            n_random=config.data.n_random,
+            n_hard=config.data.n_hard,
+            top_k=config.data.top_k,
+            n_queries=config.data.n_queries,
+            corpus_size=config.data.corpus_size,
+        )
+        del mining_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         triplets = build_random_negatives(
             dataset,
