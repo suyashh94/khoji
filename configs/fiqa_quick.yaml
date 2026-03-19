@@ -12,6 +12,7 @@ data:
   n_queries: 50            # small subset for testing. null = all queries
   corpus_size: null        # only used with hard negatives. null = full corpus
   top_k: 50                # top-k for hard negative mining
+  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
 
 # Set to null for full fine-tuning: lora: null
 lora:
