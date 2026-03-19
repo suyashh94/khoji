@@ -1,13 +1,13 @@
 """Demonstrate that khoji fine-tuning improves retrieval performance.
 
 Two experiments:
-  1. Weak model (MiniLM-L6) on FiQA  — smaller model with room to improve
-  2. Strong model (BGE-base) on NFCorpus — biomedical domain BGE hasn't seen
+  1. Weak model (MiniLM-L6) on FiQA   — smaller model with room to improve
+  2. Strong model (BGE-base) on SciFact — scientific domain, 809 train queries
 
 Usage:
     python scripts/demo_finetuning.py              # run both experiments
     python scripts/demo_finetuning.py minilm        # run only MiniLM on FiQA
-    python scripts/demo_finetuning.py nfcorpus      # run only BGE on NFCorpus
+    python scripts/demo_finetuning.py scifact       # run only BGE on SciFact
 """
 
 from __future__ import annotations
@@ -156,22 +156,22 @@ def experiment_minilm_fiqa():
     )
 
 
-def experiment_bge_nfcorpus():
-    """BGE on NFCorpus — strong model on unfamiliar biomedical domain."""
+def experiment_bge_scifact():
+    """BGE on SciFact — scientific claim verification, a domain BGE wasn't optimized for."""
     run_experiment(
-        name="BGE-base on NFCorpus (biomedical retrieval)",
+        name="BGE-base on SciFact (scientific claim verification)",
         model_name="BAAI/bge-base-en-v1.5",
-        dataset_name="nfcorpus",
+        dataset_name="scifact",
         train_split="train",
         eval_split="test",
         n_negatives=3,
         negatives="mixed",
-        epochs=3,
+        epochs=5,
         lr=2e-5,
         lora_r=16,
         lora_alpha=32,
-        batch_size=32,
-        output_dir="./forge-output/demo-bge-nfcorpus",
+        batch_size=16,
+        output_dir="./forge-output/demo-bge-scifact",
     )
 
 
@@ -180,8 +180,8 @@ if __name__ == "__main__":
 
     if which in ("minilm", "both"):
         experiment_minilm_fiqa()
-    if which in ("nfcorpus", "both"):
-        experiment_bge_nfcorpus()
+    if which in ("scifact", "both"):
+        experiment_bge_scifact()
 
     if which == "both":
         print(f"\n{'#' * 70}")
