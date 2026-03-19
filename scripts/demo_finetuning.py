@@ -5,14 +5,17 @@ Two experiments:
   2. Strong model (BGE-base) on SciFact — scientific domain, 809 train queries
 
 Usage:
-    python scripts/demo_finetuning.py              # run both experiments
-    python scripts/demo_finetuning.py minilm        # run only MiniLM on FiQA
-    python scripts/demo_finetuning.py scifact       # run only BGE on SciFact
+    python scripts/demo_finetuning.py                          # run both with defaults
+    python scripts/demo_finetuning.py minilm                   # MiniLM on FiQA
+    python scripts/demo_finetuning.py scifact                  # BGE on SciFact
+    python scripts/demo_finetuning.py minilm --n-random 3 --n-hard 2   # custom mix
+    python scripts/demo_finetuning.py scifact --n-random 0 --n-hard 3  # hard only
+    python scripts/demo_finetuning.py scifact --n-random 3 --n-hard 0  # random only
 """
 
 from __future__ import annotations
 
-import sys
+import argparse
 from functools import partial
 
 import khoji
@@ -25,8 +28,8 @@ def run_experiment(
     dataset_name: str,
     train_split: str,
     eval_split: str,
-    n_negatives: int,
-    negatives: str,
+    n_random: int,
+    n_hard: int,
     epochs: int,
     lr: float,
     lora_r: int,
@@ -36,11 +39,17 @@ def run_experiment(
 ) -> None:
     """Run a single fine-tuning experiment and print comparison."""
 
+    neg_desc = f"{n_random} random + {n_hard} hard"
+    if n_hard == 0:
+        neg_desc = f"{n_random} random"
+    elif n_random == 0:
+        neg_desc = f"{n_hard} hard"
+
     print(f"\n{'#' * 70}")
     print(f"# {name}")
     print(f"# Model: {model_name}")
     print(f"# Dataset: {dataset_name} (train={train_split}, eval={eval_split})")
-    print(f"# Negatives: {negatives}, n={n_negatives}")
+    print(f"# Negatives: {neg_desc}")
     print(f"# LoRA: r={lora_r}, alpha={lora_alpha}")
     print(f"# Training: {epochs} epochs, lr={lr}, batch_size={batch_size}")
     print(f"{'#' * 70}\n")
@@ -65,23 +74,26 @@ def run_experiment(
 
     # --- 3. Build training data ---
     print("\n--- Building Training Data ---")
-    if negatives == "hard":
-        mining_model = khoji.EmbeddingModel(model_name)
-        triplets = khoji.mine_hard_negatives(
-            train_dataset, mining_model,
-            n_negatives=n_negatives, top_k=50,
-        )
-        del mining_model
-    elif negatives == "mixed":
+    if n_random > 0 and n_hard > 0:
+        # Mixed: both random and hard negatives
         mining_model = khoji.EmbeddingModel(model_name)
         triplets = khoji.build_mixed_negatives(
             train_dataset, mining_model,
-            n_random=n_negatives, n_hard=1, top_k=50,
+            n_random=n_random, n_hard=n_hard, top_k=50,
+        )
+        del mining_model
+    elif n_hard > 0:
+        # Hard only
+        mining_model = khoji.EmbeddingModel(model_name)
+        triplets = khoji.mine_hard_negatives(
+            train_dataset, mining_model,
+            n_negatives=n_hard, top_k=50,
         )
         del mining_model
     else:
+        # Random only
         triplets = khoji.build_random_negatives(
-            train_dataset, n_negatives=n_negatives,
+            train_dataset, n_negatives=n_random,
         )
     print(f"  Total triplets: {len(triplets)}")
 
@@ -137,53 +149,71 @@ def run_experiment(
     print(f"\nResults saved to {output_dir}/")
 
 
-def experiment_minilm_fiqa():
-    """MiniLM-L6 on FiQA — a weaker model with clear room to improve."""
-    run_experiment(
-        name="MiniLM-L6 on FiQA (weak model, financial QA)",
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        dataset_name="fiqa",
-        train_split="train",
-        eval_split="test",
-        n_negatives=3,
-        negatives="mixed",
-        epochs=3,
-        lr=2e-5,
-        lora_r=16,
-        lora_alpha=32,
-        batch_size=32,
-        output_dir="./forge-output/demo-minilm-fiqa",
+EXPERIMENTS = {
+    "minilm": {
+        "name": "MiniLM-L6 on FiQA (weak model, financial QA)",
+        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+        "dataset_name": "fiqa",
+        "train_split": "train",
+        "eval_split": "test",
+        "epochs": 3,
+        "lr": 2e-5,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "batch_size": 32,
+        "output_dir": "./forge-output/demo-minilm-fiqa",
+    },
+    "scifact": {
+        "name": "BGE-base on SciFact (scientific claim verification)",
+        "model_name": "BAAI/bge-base-en-v1.5",
+        "dataset_name": "scifact",
+        "train_split": "train",
+        "eval_split": "test",
+        "epochs": 5,
+        "lr": 2e-5,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "batch_size": 16,
+        "output_dir": "./forge-output/demo-bge-scifact",
+    },
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Demo: khoji fine-tuning for retrieval")
+    parser.add_argument(
+        "experiment", nargs="?", default="both",
+        choices=["minilm", "scifact", "both"],
+        help="Which experiment to run (default: both)",
     )
-
-
-def experiment_bge_scifact():
-    """BGE on SciFact — scientific claim verification, a domain BGE wasn't optimized for."""
-    run_experiment(
-        name="BGE-base on SciFact (scientific claim verification)",
-        model_name="BAAI/bge-base-en-v1.5",
-        dataset_name="scifact",
-        train_split="train",
-        eval_split="test",
-        n_negatives=3,
-        negatives="mixed",
-        epochs=5,
-        lr=2e-5,
-        lora_r=16,
-        lora_alpha=32,
-        batch_size=16,
-        output_dir="./forge-output/demo-bge-scifact",
+    parser.add_argument(
+        "--n-random", type=int, default=2,
+        help="Random negatives per pair (default: 2)",
     )
+    parser.add_argument(
+        "--n-hard", type=int, default=1,
+        help="Hard negatives per pair (default: 1)",
+    )
+    args = parser.parse_args()
 
+    if args.n_random == 0 and args.n_hard == 0:
+        parser.error("Need at least one of --n-random or --n-hard > 0")
 
-if __name__ == "__main__":
-    which = sys.argv[1] if len(sys.argv) > 1 else "both"
+    experiments_to_run = list(EXPERIMENTS.keys()) if args.experiment == "both" else [args.experiment]
 
-    if which in ("minilm", "both"):
-        experiment_minilm_fiqa()
-    if which in ("scifact", "both"):
-        experiment_bge_scifact()
+    for exp_name in experiments_to_run:
+        exp = EXPERIMENTS[exp_name]
+        run_experiment(
+            n_random=args.n_random,
+            n_hard=args.n_hard,
+            **exp,
+        )
 
-    if which == "both":
+    if len(experiments_to_run) > 1:
         print(f"\n{'#' * 70}")
         print("# Both experiments complete. Check forge-output/ for results.")
         print(f"{'#' * 70}")
+
+
+if __name__ == "__main__":
+    main()
