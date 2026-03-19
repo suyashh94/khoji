@@ -37,7 +37,7 @@ class MultimodalDataConfig:
     Args:
         dataset: HuggingFace dataset name or path to local dataset directory.
         split: Dataset split for training data.
-        negatives: Negative mining strategy: "random" or "hard".
+        negatives: Negative mining strategy: "random", "hard", or "mixed".
         n_negatives: Number of negatives per (query, positive_image) pair.
         n_queries: Number of queries to use. None = all.
         corpus_size: Corpus size limit. None = all. Relevant images always included.
@@ -138,9 +138,9 @@ class MultimodalForgeConfig:
             )
 
         # Validate negatives
-        if self.data.negatives not in {"random", "hard"}:
+        if self.data.negatives not in {"random", "hard", "mixed"}:
             raise ValueError(
-                f"data.negatives must be 'random' or 'hard', "
+                f"data.negatives must be 'random', 'hard', or 'mixed', "
                 f"got {self.data.negatives!r}"
             )
 
