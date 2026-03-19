@@ -121,6 +121,20 @@ def run(config: ForgeConfig) -> RunResult:
     print("=" * 60)
     dataset = _load(config.data.dataset, config.data.split)
 
+    if config.data.negatives not in ("random", "hard", "mixed"):
+        raise ValueError(
+            f"Unknown negatives mode: {config.data.negatives!r}. "
+            "Use 'random', 'hard', or 'mixed'."
+        )
+
+    if config.data.negatives == "mixed":
+        if config.data.n_random == 0 and config.data.n_hard == 0:
+            raise ValueError("negatives: mixed requires n_random > 0 or n_hard > 0.")
+    elif config.data.negatives in ("random", "hard"):
+        if config.data.n_random != 1 or config.data.n_hard != 1:
+            print(f"Note: n_random/n_hard are ignored when negatives is '{config.data.negatives}'. "
+                  f"Using n_negatives={config.data.n_negatives} instead.")
+
     if config.data.negatives == "hard":
         mining_model = EmbeddingModel(config.model.name, max_length=config.train.max_length, dtype=config.model.dtype)
         triplets = mine_hard_negatives(
