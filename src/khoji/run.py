@@ -146,12 +146,21 @@ def run(config: ForgeConfig) -> RunResult:
                 print(f"\n{'=' * 60}")
                 print(f"HARD NEGATIVE MINING  {round_label}")
                 print("=" * 60)
-            mining_model = EmbeddingModel(
-                config.model.name,
-                adapter_path=current_adapter,
-                max_length=config.train.max_length,
-                dtype=config.model.dtype,
-            )
+            if current_adapter is not None and config.lora is None:
+                # Full fine-tuning: load the saved model directly
+                mining_model = EmbeddingModel(
+                    current_adapter,
+                    max_length=config.train.max_length,
+                    dtype=config.model.dtype,
+                )
+            else:
+                # LoRA: load base model + adapter (or just base model for round 1)
+                mining_model = EmbeddingModel(
+                    config.model.name,
+                    adapter_path=current_adapter,
+                    max_length=config.train.max_length,
+                    dtype=config.model.dtype,
+                )
             triplets = mine_hard_negatives(
                 dataset,
                 mining_model,
@@ -161,6 +170,8 @@ def run(config: ForgeConfig) -> RunResult:
                 corpus_size=config.data.corpus_size,
             )
             del mining_model  # free memory before training
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             triplets = build_random_negatives(
                 dataset,
