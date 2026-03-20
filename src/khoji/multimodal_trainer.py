@@ -1,4 +1,4 @@
-"""Training loop for fine-tuning multimodal models (text-to-image)."""
+"""Training loop for multimodal (text-to-image) fine-tuning."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Callable
 
 import torch
+from PIL import Image
+from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from khoji.device import get_device
 from khoji.image_utils import build_image_processor, load_images_batch
@@ -22,12 +25,7 @@ from khoji.trainer import TrainHistory
 
 @dataclass
 class MultimodalTrainingConfig:
-    """Training hyperparameters for multimodal fine-tuning.
-
-    Args:
-        lora_target: Which encoder(s) to apply LoRA to: "vision", "text", or "both".
-        cache_dir: Directory for caching downloaded images during training.
-    """
+    """Training hyperparameters for multimodal fine-tuning."""
 
     epochs: int = 3
     batch_size: int = 8
@@ -36,7 +34,7 @@ class MultimodalTrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
-    max_length: int = 77  # CLIP default
+    max_length: int = 77
     mixed_precision: str | None = None
     loss_fn: Callable[..., torch.Tensor] = triplet_margin_loss
     lora: LoRASettings | None = None
@@ -48,35 +46,52 @@ class MultimodalTrainingConfig:
     keep_all_checkpoints: bool = False
     dtype: str | None = None
     cache_dir: str | None = None
-    base_dir: str | None = None  # for resolving relative image paths
+    base_dir: str | None = None
 
 
 class MultimodalTrainer:
     """Fine-tunes a multimodal model on text-image triplets.
 
-    **HuggingFace CLIP/SigLIP models:**
+    **HuggingFace CLIP/SigLIP** (auto-wires encode functions):
 
-        MultimodalTrainer("openai/clip-vit-base-patch32", config)
+        trainer = MultimodalTrainer("openai/clip-vit-base-patch32", config)
 
-    **Custom models:**
+    **Custom model** — provide model + encode functions:
 
-        MultimodalTrainer(
-            text_model=my_text_encoder,
-            vision_model=my_vision_encoder,
-            tokenizer=my_tokenizer,
-            image_processor=my_processor,
+        trainer = MultimodalTrainer(
+            model=my_clip_model,
+            encode_text_fn=my_text_fn,    # (texts: list[str]) -> Tensor
+            encode_image_fn=my_image_fn,  # (sources: list[str]) -> Tensor
             config=config,
         )
+
+    Encode functions are called with gradients enabled during training.
+    Library handles L2 normalization.
+
+    Args:
+        model_name: HuggingFace model ID (CLIP/SigLIP).
+        config: Training configuration.
+        model: Custom nn.Module for parameters/LoRA/save.
+        encode_text_fn: Custom text encoding function.
+            ``(texts: list[str]) -> Tensor (batch, dim)``.
+        encode_image_fn: Custom image encoding function.
+            ``(sources: list[str]) -> Tensor (batch, dim)``.
+            Receives image source paths/URLs, not PIL images.
+        preprocess_overrides: Dict with image_size, mean, std overrides.
+        adapter_path: Path to saved LoRA adapter for warm-starting.
     """
 
     def __init__(
         self,
         model_name: str | None = None,
         config: MultimodalTrainingConfig | None = None,
-        text_model: torch.nn.Module | None = None,
-        vision_model: torch.nn.Module | None = None,
-        tokenizer: object | None = None,
-        image_processor: Callable | None = None,
+        model: torch.nn.Module | None = None,
+        encode_text_fn: (
+            Callable[[list[str]], torch.Tensor] | None
+        ) = None,
+        encode_image_fn: (
+            Callable[[list[str]], torch.Tensor] | None
+        ) = None,
         preprocess_overrides: dict | None = None,
         adapter_path: str | None = None,
     ):
@@ -84,56 +99,60 @@ class MultimodalTrainer:
         self.config = config or MultimodalTrainingConfig()
         self.device = get_device()
 
-        if text_model is not None and vision_model is not None:
-            # Custom model path
-            if tokenizer is None:
-                raise ValueError("Must provide tokenizer with custom models.")
-            if image_processor is None:
-                raise ValueError("Must provide image_processor with custom models.")
-            self.tokenizer = tokenizer
-            self.image_processor = image_processor
-            self._full_model = None
-            self.text_encoder = text_model.to(self.device)
-            self.vision_encoder = vision_model.to(self.device)
+        if model is not None and encode_text_fn is not None and encode_image_fn is not None:
+            # Custom model + encode functions
+            self.model = model.to(self.device)
+            self._encode_text_fn = encode_text_fn
+            self._encode_image_fn = encode_image_fn
 
         elif model_name is not None:
+            # HuggingFace convenience path
             self._load_hf_model(model_name, preprocess_overrides)
-            # Allow custom image_processor to override the auto-detected one
-            if image_processor is not None:
-                self.image_processor = image_processor
 
         else:
-            raise ValueError("Provide either model_name or (text_model + vision_model).")
+            raise ValueError(
+                "Provide either model_name or "
+                "(model + encode_text_fn + encode_image_fn)."
+            )
 
-        # Apply LoRA (or warm-start from previous adapter)
+        # Apply LoRA
         self._apply_lora(adapter_path=adapter_path)
 
-        # Mixed precision setup
+        # Mixed precision
         self.amp_dtype = None
         self.scaler = None
         if self.config.mixed_precision is not None:
             if self.config.mixed_precision == "fp16":
                 self.amp_dtype = torch.float16
-                self.scaler = torch.amp.GradScaler(device=self.device.type)
+                self.scaler = torch.amp.GradScaler(
+                    device=self.device.type
+                )
             elif self.config.mixed_precision == "bf16":
                 self.amp_dtype = torch.bfloat16
             else:
                 raise ValueError(
-                    f"Unknown mixed_precision: {self.config.mixed_precision}. "
-                    "Use 'fp16', 'bf16', or null."
+                    f"Unknown mixed_precision: "
+                    f"{self.config.mixed_precision}"
                 )
 
-        effective_bs = self.config.batch_size * self.config.grad_accum_steps
-        amp_str = f" | AMP: {self.config.mixed_precision}" if self.config.mixed_precision else ""
+        effective_bs = (
+            self.config.batch_size * self.config.grad_accum_steps
+        )
+        amp_str = (
+            f" | AMP: {self.config.mixed_precision}"
+            if self.config.mixed_precision else ""
+        )
         print(
             f"Effective batch size: {effective_bs} "
-            f"(micro={self.config.batch_size} x accum={self.config.grad_accum_steps})"
-            f"{amp_str}"
+            f"(micro={self.config.batch_size} "
+            f"x accum={self.config.grad_accum_steps}){amp_str}"
         )
 
-    def _load_hf_model(self, model_name: str, preprocess_overrides: dict | None) -> None:
-        """Load a CLIP/SigLIP model from HuggingFace."""
-        from transformers import AutoConfig, AutoTokenizer
+    def _load_hf_model(
+        self, model_name: str, preprocess_overrides: dict | None
+    ) -> None:
+        """Load CLIP/SigLIP and wire up encode functions."""
+        from transformers import AutoConfig
 
         model_config = AutoConfig.from_pretrained(model_name)
         model_type = getattr(model_config, "model_type", "unknown")
@@ -145,52 +164,92 @@ class MultimodalTrainer:
 
         if model_type == "clip":
             from transformers import CLIPModel
-
-            self._full_model = CLIPModel.from_pretrained(model_name, **load_kwargs).to(self.device)
+            full_model = CLIPModel.from_pretrained(
+                model_name, **load_kwargs
+            ).to(self.device)
         elif model_type == "siglip":
             from transformers import SiglipModel
-
-            self._full_model = SiglipModel.from_pretrained(model_name, **load_kwargs).to(self.device)
+            full_model = SiglipModel.from_pretrained(
+                model_name, **load_kwargs
+            ).to(self.device)
         else:
             from transformers import AutoModel
+            full_model = AutoModel.from_pretrained(
+                model_name, **load_kwargs
+            ).to(self.device)
 
-            self._full_model = AutoModel.from_pretrained(model_name, **load_kwargs).to(self.device)
-
-        self.text_encoder = self._full_model.text_model
-        self.vision_encoder = self._full_model.vision_model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.image_processor = build_image_processor(
-            model_name=model_name, overrides=preprocess_overrides
+        self.model = full_model
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._image_processor = build_image_processor(
+            model_name=model_name, overrides=preprocess_overrides,
         )
 
-        dtype_str = f" | dtype: {self.config.dtype}" if self.config.dtype else ""
-        print(f"Loaded {model_name} | type: {model_type} | device: {self.device}{dtype_str}")
+        # Wire encode functions via closures
+        device = self.device
+        max_length = self.config.max_length
+        tokenizer = self._tokenizer
+        image_processor = self._image_processor
+        base_dir = self.config.base_dir
+        cache_dir = self.config.cache_dir
+
+        def _encode_text(texts: list[str]) -> torch.Tensor:
+            encoded = tokenizer(
+                list(texts), padding=True, truncation=True,
+                max_length=max_length, return_tensors="pt",
+            ).to(device)
+            # Access text_model through self.model (may be wrapped by peft)
+            base = self.model
+            if hasattr(base, "base_model"):
+                base = base.base_model.model
+            outputs = base.text_model(**encoded)
+            pooled = outputs.pooler_output
+            text_proj = getattr(base, "text_projection", None)
+            if text_proj is not None:
+                return text_proj(pooled)
+            return pooled
+
+        def _encode_images(sources: list[str]) -> torch.Tensor:
+            images = load_images_batch(
+                list(sources), base_dir=base_dir, cache_dir=cache_dir,
+            )
+            pixel_values = image_processor(images).to(device)
+            base = self.model
+            if hasattr(base, "base_model"):
+                base = base.base_model.model
+            outputs = base.vision_model(pixel_values=pixel_values)
+            pooled = outputs.pooler_output
+            visual_proj = getattr(base, "visual_projection", None)
+            if visual_proj is not None:
+                return visual_proj(pooled)
+            return pooled
+
+        self._encode_text_fn = _encode_text
+        self._encode_image_fn = _encode_images
+
+        dtype_str = (
+            f" | dtype: {self.config.dtype}"
+            if self.config.dtype else ""
+        )
+        print(
+            f"Loaded {model_name} | type: {model_type} | "
+            f"device: {self.device}{dtype_str}"
+        )
 
     def _apply_lora(self, adapter_path: str | None = None) -> None:
-        """Apply LoRA to the full model targeting text/vision/both encoders."""
+        """Apply LoRA to the model."""
         if self.config.lora is None:
             return
 
-        if self._full_model is None:
-            # Custom models: apply LoRA to sub-models directly
-            target = self.config.lora_target
-            if target in ("text", "both"):
-                self.text_encoder = apply_lora(self.text_encoder, self.config.lora)
-            if target in ("vision", "both"):
-                self.vision_encoder = apply_lora(self.vision_encoder, self.config.lora)
-            return
-
         if adapter_path is not None:
-            # Warm-start from a previously trained adapter
-            from peft import PeftModel
-
-            self._full_model = PeftModel.from_pretrained(
-                self._full_model, adapter_path, is_trainable=True
+            self.model = PeftModel.from_pretrained(
+                self.model, adapter_path, is_trainable=True
             )
             trainable = sum(
-                p.numel() for p in self._full_model.parameters() if p.requires_grad
+                p.numel()
+                for p in self.model.parameters()
+                if p.requires_grad
             )
-            total = sum(p.numel() for p in self._full_model.parameters())
+            total = sum(p.numel() for p in self.model.parameters())
             print(
                 f"LoRA warm-start from {adapter_path} | "
                 f"trainable: {trainable:,} / {total:,} "
@@ -198,12 +257,14 @@ class MultimodalTrainer:
             )
             return
 
-        # HuggingFace models: apply LoRA to the full model, then freeze
-        # the sub-model we don't want to train
+        # Apply fresh LoRA
         from peft import LoraConfig, TaskType, get_peft_model
 
         target = self.config.lora_target
-        base_modules = self.config.lora.target_modules or ["q_proj", "k_proj", "v_proj"]
+        base_modules = (
+            self.config.lora.target_modules
+            or ["q_proj", "k_proj", "v_proj"]
+        )
 
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
@@ -213,58 +274,79 @@ class MultimodalTrainer:
             target_modules=base_modules,
         )
 
-        self._full_model = get_peft_model(self._full_model, lora_config)
+        self.model = get_peft_model(self.model, lora_config)
 
-        # Freeze the sub-model(s) we don't want to train LoRA on
+        # Freeze sub-model(s) based on lora_target
         if target == "vision":
-            for name, param in self._full_model.named_parameters():
+            for name, param in self.model.named_parameters():
                 if param.requires_grad and "text_model" in name:
                     param.requires_grad = False
         elif target == "text":
-            for name, param in self._full_model.named_parameters():
+            for name, param in self.model.named_parameters():
                 if param.requires_grad and "vision_model" in name:
                     param.requires_grad = False
 
-        self.text_encoder = self._full_model.base_model.model.text_model
-        self.vision_encoder = self._full_model.base_model.model.vision_model
-
-        trainable = sum(p.numel() for p in self._full_model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self._full_model.parameters())
+        trainable = sum(
+            p.numel()
+            for p in self.model.parameters()
+            if p.requires_grad
+        )
+        total = sum(p.numel() for p in self.model.parameters())
         print(
-            f"LoRA applied | target: {target} | modules: {base_modules} | "
-            f"trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)"
+            f"LoRA applied | target: {target} | "
+            f"modules: {base_modules} | "
+            f"trainable: {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.2f}%)"
         )
 
+    def _encode_text_batch(self, texts):
+        """Encode text batch and normalize."""
+        emb = self._encode_text_fn(list(texts))
+        return torch.nn.functional.normalize(emb, p=2, dim=1)
+
+    def _encode_image_batch(self, sources):
+        """Encode image batch and normalize."""
+        emb = self._encode_image_fn(list(sources))
+        return torch.nn.functional.normalize(emb, p=2, dim=1)
+
     def train(self, dataset: MultimodalTripletDataset) -> TrainHistory:
-        """Run the training loop.
-
-        Args:
-            dataset: MultimodalTripletDataset of (query_text, pos_image, neg_image).
-
-        Returns:
-            TrainHistory with per-step loss, lr, grad norm, and per-epoch loss.
-        """
+        """Run the training loop."""
         history = TrainHistory()
 
-        # Overfit mode
         overfit_samples = None
         if self.config.overfit_batches is not None:
             n = self.config.overfit_batches
-            subset = [dataset[i] for i in range(min(n * self.config.batch_size, len(dataset)))]
+            subset = [
+                dataset[i]
+                for i in range(
+                    min(n * self.config.batch_size, len(dataset))
+                )
+            ]
             from khoji.multimodal_data import MultimodalTriplet
-
-            dataset = MultimodalTripletDataset([MultimodalTriplet(*s) for s in subset])
+            dataset = MultimodalTripletDataset(
+                [MultimodalTriplet(*s) for s in subset]
+            )
             overfit_samples = subset
-            print(f"\n[OVERFIT MODE] Training on {len(dataset)} samples for {self.config.epochs} epochs")
+            print(
+                f"\n[OVERFIT MODE] Training on {len(dataset)} samples "
+                f"for {self.config.epochs} epochs"
+            )
             self._overfit_report("BEFORE training", overfit_samples)
         else:
-            print(f"\nTraining on {len(dataset)} triplets for {self.config.epochs} epochs")
+            print(
+                f"\nTraining on {len(dataset)} triplets "
+                f"for {self.config.epochs} epochs"
+            )
             if self.config.sanity_check_samples > 0:
                 import random
-                n_check = min(self.config.sanity_check_samples, len(dataset))
+                n_check = min(
+                    self.config.sanity_check_samples, len(dataset)
+                )
                 indices = random.sample(range(len(dataset)), n_check)
                 overfit_samples = [dataset[i] for i in indices]
-                self._overfit_report("BEFORE training", overfit_samples)
+                self._overfit_report(
+                    "BEFORE training", overfit_samples
+                )
 
         dataloader = DataLoader(
             dataset,
@@ -272,25 +354,19 @@ class MultimodalTrainer:
             shuffle=self.config.overfit_batches is None,
         )
 
-        # Collect trainable params
-        if self._full_model is not None:
-            trainable_params = [p for p in self._full_model.parameters() if p.requires_grad]
-        else:
-            trainable_params = []
-            for p in self.text_encoder.parameters():
-                if p.requires_grad:
-                    trainable_params.append(p)
-            for p in self.vision_encoder.parameters():
-                if p.requires_grad:
-                    trainable_params.append(p)
-
+        trainable_params = [
+            p for p in self.model.parameters() if p.requires_grad
+        ]
         optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
 
-        steps_per_epoch = (len(dataloader) + self.config.grad_accum_steps - 1) // self.config.grad_accum_steps
+        steps_per_epoch = (
+            (len(dataloader) + self.config.grad_accum_steps - 1)
+            // self.config.grad_accum_steps
+        )
         total_opt_steps = steps_per_epoch * self.config.epochs
         total_batches = len(dataloader) * self.config.epochs
         scheduler = self._build_scheduler(optimizer, total_opt_steps)
@@ -301,10 +377,7 @@ class MultimodalTrainer:
             f"Grad clipping: {self.config.max_grad_norm}\n"
         )
 
-        # Set to train mode
-        self.text_encoder.train()
-        self.vision_encoder.train()
-        global_batch = 0
+        self.model.train()
         global_opt_step = 0
         accum_loss = 0.0
 
@@ -315,47 +388,49 @@ class MultimodalTrainer:
             epoch_batches = 0
             optimizer.zero_grad()
 
-            for batch_idx, (queries, pos_sources, neg_sources) in enumerate(dataloader):
+            for batch_idx, (queries, pos_src, neg_src) in enumerate(
+                dataloader
+            ):
                 if self.amp_dtype is not None:
-                    with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                        query_emb = self._encode_text_batch(queries)
-                        pos_emb = self._encode_image_batch(pos_sources)
-                        neg_emb = self._encode_image_batch(neg_sources)
-                        loss = self.config.loss_fn(query_emb, pos_emb, neg_emb)
+                    with torch.amp.autocast(
+                        device_type=self.device.type,
+                        dtype=self.amp_dtype,
+                    ):
+                        q = self._encode_text_batch(queries)
+                        p = self._encode_image_batch(pos_src)
+                        n = self._encode_image_batch(neg_src)
+                        loss = self.config.loss_fn(q, p, n)
                 else:
-                    query_emb = self._encode_text_batch(queries)
-                    pos_emb = self._encode_image_batch(pos_sources)
-                    neg_emb = self._encode_image_batch(neg_sources)
-                    loss = self.config.loss_fn(query_emb, pos_emb, neg_emb)
+                    q = self._encode_text_batch(queries)
+                    p = self._encode_image_batch(pos_src)
+                    n = self._encode_image_batch(neg_src)
+                    loss = self.config.loss_fn(q, p, n)
 
-                scaled_loss = loss / self.config.grad_accum_steps
-
+                scaled = loss / self.config.grad_accum_steps
                 if self.scaler is not None:
-                    self.scaler.scale(scaled_loss).backward()
+                    self.scaler.scale(scaled).backward()
                 else:
-                    scaled_loss.backward()
+                    scaled.backward()
 
-                batch_loss = loss.item()
-                accum_loss += batch_loss
-                epoch_loss += batch_loss
+                bl = loss.item()
+                accum_loss += bl
+                epoch_loss += bl
                 epoch_batches += 1
-                global_batch += 1
 
-                is_accum_step = (batch_idx + 1) % self.config.grad_accum_steps == 0
-                is_last_batch = (batch_idx + 1) == len(dataloader)
+                is_accum = (
+                    (batch_idx + 1) % self.config.grad_accum_steps == 0
+                )
+                is_last = (batch_idx + 1) == len(dataloader)
 
-                if is_accum_step or is_last_batch:
+                if is_accum or is_last:
                     if self.scaler is not None:
                         self.scaler.unscale_(optimizer)
 
                     grad_norm = 0.0
                     if self.config.max_grad_norm is not None:
-                        if self._full_model is not None:
-                            all_params = list(self._full_model.parameters())
-                        else:
-                            all_params = list(self.text_encoder.parameters()) + list(self.vision_encoder.parameters())
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            all_params, self.config.max_grad_norm
+                            self.model.parameters(),
+                            self.config.max_grad_norm,
                         ).item()
 
                     if self.scaler is not None:
@@ -368,39 +443,40 @@ class MultimodalTrainer:
                     optimizer.zero_grad()
                     global_opt_step += 1
 
-                    n_accum = (batch_idx % self.config.grad_accum_steps) + 1
-                    step_loss = accum_loss / n_accum
-                    step_lr = scheduler.get_last_lr()[0]
-
-                    history.step_loss.append(step_loss)
-                    history.step_lr.append(step_lr)
+                    n_accum = (
+                        batch_idx % self.config.grad_accum_steps
+                    ) + 1
+                    history.step_loss.append(accum_loss / n_accum)
+                    history.step_lr.append(
+                        scheduler.get_last_lr()[0]
+                    )
                     history.step_grad_norm.append(grad_norm)
                     accum_loss = 0.0
 
                     if (
                         self.config.save_every_n_steps is not None
                         and self.config.save_dir is not None
-                        and global_opt_step % self.config.save_every_n_steps == 0
+                        and global_opt_step
+                        % self.config.save_every_n_steps == 0
                     ):
                         self._save_checkpoint(global_opt_step)
 
                 pbar.update(1)
                 pbar.set_postfix(
-                    epoch=f"{epoch + 1}/{self.config.epochs}",
-                    loss=f"{batch_loss:.4f}",
+                    epoch=f"{epoch+1}/{self.config.epochs}",
+                    loss=f"{bl:.4f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
 
-            epoch_avg = epoch_loss / max(epoch_batches, 1)
-            history.epoch_loss.append(epoch_avg)
+            avg = epoch_loss / max(epoch_batches, 1)
+            history.epoch_loss.append(avg)
             tqdm.write(
-                f"  Epoch {epoch + 1}/{self.config.epochs} complete | "
-                f"Avg Loss: {epoch_avg:.4f}"
+                f"  Epoch {epoch+1}/{self.config.epochs} complete | "
+                f"Avg Loss: {avg:.4f}"
             )
 
         pbar.close()
 
-        # Show after-training metrics
         if overfit_samples is not None:
             self._overfit_report("AFTER training", overfit_samples)
 
@@ -410,20 +486,16 @@ class MultimodalTrainer:
         return history
 
     def save(self, path: str) -> None:
-        """Save the model weights."""
+        """Save model weights."""
         save_path = Path(path)
         save_path.mkdir(parents=True, exist_ok=True)
-
-        if self._full_model is not None:
-            self._full_model.save_pretrained(save_path)
-        else:
-            # Custom models: save both encoders
-            torch.save(self.text_encoder.state_dict(), save_path / "text_encoder.pt")
-            torch.save(self.vision_encoder.state_dict(), save_path / "vision_encoder.pt")
-
-        self.tokenizer.save_pretrained(save_path)
-
-        label = "LoRA adapter" if self.config.lora is not None else "Full model"
+        self.model.save_pretrained(save_path)
+        if hasattr(self, "_tokenizer") and self._tokenizer is not None:
+            self._tokenizer.save_pretrained(save_path)
+        label = (
+            "LoRA adapter" if self.config.lora is not None
+            else "Full model"
+        )
         print(f"{label} saved to {save_path}")
 
     def _save_checkpoint(self, step: int) -> None:
@@ -435,25 +507,14 @@ class MultimodalTrainer:
             ckpt_dir = base / "checkpoint-latest"
             if ckpt_dir.exists():
                 shutil.rmtree(ckpt_dir)
-
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        if self._full_model is not None:
-            self._full_model.save_pretrained(ckpt_dir)
-        else:
-            torch.save(self.text_encoder.state_dict(), ckpt_dir / "text_encoder.pt")
-            torch.save(self.vision_encoder.state_dict(), ckpt_dir / "vision_encoder.pt")
-        self.tokenizer.save_pretrained(ckpt_dir)
+        self.model.save_pretrained(ckpt_dir)
         tqdm.write(f"  Checkpoint saved to {ckpt_dir}")
 
     @torch.no_grad()
-    def _overfit_report(self, label: str, samples: list[tuple[str, str, str]]) -> None:
-        """Print cosine similarity metrics for sanity check samples.
-
-        Shows per-sample cos_sim(query, positive_image) and cos_sim(query, negative_image),
-        plus the margin (pos - neg) and whether the model ranks the positive higher.
-        """
-        self.text_encoder.eval()
-        self.vision_encoder.eval()
+    def _overfit_report(self, label, samples):
+        """Print cosine similarity metrics for sanity check."""
+        self.model.eval()
 
         queries = [s[0] for s in samples]
         positives = [s[1] for s in samples]
@@ -468,100 +529,45 @@ class MultimodalTrainer:
         margin = pos_sim - neg_sim
 
         print(f"\n  [{label}] Sanity check ({len(samples)} samples):")
-        print(f"    Avg cos_sim(query, pos_image):   {pos_sim.mean().item():.4f}")
-        print(f"    Avg cos_sim(query, neg_image):   {neg_sim.mean().item():.4f}")
-        print(f"    Avg margin (pos - neg):          {margin.mean().item():.4f}")
-        print(f"    Samples where pos > neg:         {(margin > 0).sum().item()}/{len(samples)}")
+        print(
+            f"    Avg cos_sim(query, pos):  "
+            f"{pos_sim.mean().item():.4f}"
+        )
+        print(
+            f"    Avg cos_sim(query, neg):  "
+            f"{neg_sim.mean().item():.4f}"
+        )
+        print(
+            f"    Avg margin (pos - neg):   "
+            f"{margin.mean().item():.4f}"
+        )
+        print(
+            f"    Samples where pos > neg:  "
+            f"{(margin > 0).sum().item()}/{len(samples)}"
+        )
 
         if len(samples) <= 10:
-            print(f"    {'Sample':<8} {'pos_sim':>8} {'neg_sim':>8} {'margin':>8} {'correct':>8}")
+            print(
+                f"    {'Sample':<8} {'pos_sim':>8} {'neg_sim':>8} "
+                f"{'margin':>8} {'correct':>8}"
+            )
             print(f"    {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
             for i in range(len(samples)):
-                correct = "yes" if margin[i].item() > 0 else "NO"
+                c = "yes" if margin[i].item() > 0 else "NO"
                 print(
-                    f"    {i:<8} {pos_sim[i].item():>8.4f} {neg_sim[i].item():>8.4f} "
-                    f"{margin[i].item():>8.4f} {correct:>8}"
+                    f"    {i:<8} {pos_sim[i].item():>8.4f} "
+                    f"{neg_sim[i].item():>8.4f} "
+                    f"{margin[i].item():>8.4f} {c:>8}"
                 )
         print()
 
-        self.text_encoder.train()
-        self.vision_encoder.train()
+        self.model.train()
 
-    def _encode_text_batch(self, texts: list[str] | tuple[str, ...]) -> torch.Tensor:
-        """Encode a batch of text queries."""
-        encoded = self.tokenizer(
-            list(texts),
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
-            return_tensors="pt",
-        ).to(self.device)
-
-        embeddings = self._extract_text_features(encoded)
-        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
-    def _encode_image_batch(self, image_sources: list[str] | tuple[str, ...]) -> torch.Tensor:
-        """Load and encode a batch of images."""
-        images = load_images_batch(
-            list(image_sources),
-            base_dir=self.config.base_dir,
-            cache_dir=self.config.cache_dir,
-        )
-        pixel_values = self.image_processor(images).to(self.device)
-
-        embeddings = self._extract_image_features(pixel_values)
-        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
-    def _extract_text_features(self, encoded: dict) -> torch.Tensor:
-        """Extract text embeddings from tokenized inputs."""
-        if self._full_model is not None:
-            # Access the underlying model (unwrap peft if needed)
-            base = self._full_model
-            if hasattr(base, "base_model"):
-                base = base.base_model.model
-            outputs = base.text_model(**encoded)
-            pooled = outputs.pooler_output
-            text_proj = getattr(base, "text_projection", None)
-            if text_proj is not None:
-                return text_proj(pooled)
-            return pooled
-        else:
-            outputs = self.text_encoder(**encoded)
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                return outputs.pooler_output
-            if hasattr(outputs, "last_hidden_state"):
-                return outputs.last_hidden_state[:, 0, :]
-            return outputs
-
-    def _extract_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Extract image embeddings from pixel values."""
-        if self._full_model is not None:
-            base = self._full_model
-            if hasattr(base, "base_model"):
-                base = base.base_model.model
-            outputs = base.vision_model(pixel_values=pixel_values)
-            pooled = outputs.pooler_output
-            visual_proj = getattr(base, "visual_projection", None)
-            if visual_proj is not None:
-                return visual_proj(pooled)
-            return pooled
-        else:
-            outputs = self.vision_encoder(pixel_values)
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                return outputs.pooler_output
-            if hasattr(outputs, "last_hidden_state"):
-                return outputs.last_hidden_state[:, 0, :]
-            return outputs
-
-    def _build_scheduler(
-        self,
-        optimizer: torch.optim.Optimizer,
-        total_steps: int,
-    ) -> torch.optim.lr_scheduler.LambdaLR:
-        """Linear warmup then linear decay schedule."""
+    def _build_scheduler(self, optimizer, total_steps):
+        """Linear warmup then linear decay."""
         warmup = self.config.warmup_steps
 
-        def lr_lambda(step: int) -> float:
+        def lr_lambda(step):
             if step < warmup:
                 return step / max(warmup, 1)
             remaining = total_steps - step
