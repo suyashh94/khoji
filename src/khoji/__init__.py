@@ -30,7 +30,7 @@ from khoji.multimodal_data import (
 )
 from khoji.multimodal_dataset import MultimodalRetrievalDataset, load_flickr30k, load_rsicd, load_custom_multimodal
 from khoji.multimodal_evaluator import MultimodalEvaluator
-from khoji.multimodal_model import MultimodalEmbeddingModel
+from khoji.multimodal_model import JointEmbeddingModel, MultimodalEmbeddingModel
 from khoji.multimodal_run import run_multimodal
 from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
 from khoji.image_utils import load_image, load_images_batch
@@ -62,6 +62,7 @@ __all__ = [
     "run",
     "triplet_margin_loss",
     # Multimodal (text-to-image)
+    "JointEmbeddingModel",
     "MultimodalEmbeddingModel",
     "MultimodalEvaluator",
     "MultimodalForgeConfig",

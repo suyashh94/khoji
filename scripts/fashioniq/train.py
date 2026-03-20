@@ -250,7 +250,7 @@ def build_mixed_triplets(
 
 
 def train(
-    model: khoji.MultimodalEmbeddingModel,
+    model: khoji.JointEmbeddingModel,
     triplets: list[ComposedTriplet],
     url_mapping: dict[str, str],
     cache_dir: Path | None = None,
@@ -369,7 +369,7 @@ def train(
 
 @torch.no_grad()
 def evaluate(
-    model: khoji.MultimodalEmbeddingModel,
+    model: khoji.JointEmbeddingModel,
     annotations: list[dict],
     gallery_ids: list[str],
     url_mapping: dict[str, str],
@@ -488,7 +488,7 @@ def run_experiment(
 
     # Build model using khoji
     lora = khoji.LoRASettings(r=lora_r, alpha=lora_r * 2, dropout=0.1)
-    model = khoji.MultimodalEmbeddingModel(model_name)
+    model = khoji.JointEmbeddingModel(model_name)
     model._full_model = khoji.lora.apply_lora(model._full_model, lora)
 
     # Baseline
