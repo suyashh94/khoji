@@ -18,6 +18,10 @@ from urllib.request import urlretrieve
 BASE_URL = (
     "https://raw.githubusercontent.com/XiaoxiaoGuo/fashion-iq/master"
 )
+METADATA_URL = (
+    "https://raw.githubusercontent.com/"
+    "hongwang600/fashion-iq-metadata/master/image_url"
+)
 
 CATEGORIES = ["dress", "shirt", "toptee"]
 SPLITS = ["train", "val", "test"]
@@ -55,6 +59,16 @@ def download_image_splits(output_dir: Path) -> None:
             download_file(url, splits_dir / filename)
 
 
+def download_url_mappings(output_dir: Path) -> None:
+    """Download ASIN → image URL mapping files."""
+    print("\nDownloading image URL mappings...")
+    url_dir = output_dir / "image_url"
+    for cat in CATEGORIES:
+        filename = f"asin2url.{cat}.txt"
+        url = f"{METADATA_URL}/{filename}"
+        download_file(url, url_dir / filename)
+
+
 def summarize(output_dir: Path) -> None:
     """Print summary of downloaded data."""
     print("\n" + "=" * 60)
@@ -81,11 +95,18 @@ def summarize(output_dir: Path) -> None:
 
             print(f"    {split:>5}: {n_caps:>6} annotations, {n_images:>6} images")
 
+    # URL mapping stats
+    url_dir = output_dir / "image_url"
+    for cat in CATEGORIES:
+        url_file = url_dir / f"asin2url.{cat}.txt"
+        if url_file.exists():
+            n_urls = sum(1 for _ in open(url_file))
+            print(f"\n  {cat} URL mappings: {n_urls}")
+
     print(f"\nData saved to: {output_dir}")
-    print("\nNext steps:")
-    print("  1. Download images (see fashion-iq-metadata repo)")
-    print("  2. Place images in: {output_dir}/images/")
-    print("  3. Run: python scripts/fashioniq/train.py")
+    print("\nNext step:")
+    print("  python scripts/fashioniq/train.py --category dress --epochs 5")
+    print("  (images are loaded via URL and cached automatically)")
 
 
 def main():
@@ -94,6 +115,7 @@ def main():
 
     download_captions(output_dir)
     download_image_splits(output_dir)
+    download_url_mappings(output_dir)
     summarize(output_dir)
 
 

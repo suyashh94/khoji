@@ -3,14 +3,13 @@
 Query = (reference image + modification caption) → retrieve target image.
 Uses BLIP-2's Q-Former to jointly encode (image, text) into a shared space.
 
+Images are loaded on the fly via URLs (cached locally on first download).
+
 Usage:
-    # 1. Download data first
+    # 1. Download annotations + URL mappings
     python scripts/fashioniq/download_data.py
 
-    # 2. Download images (place in data/fashioniq/images/)
-    #    Images are named by product ID: B008BHCT58.jpg
-
-    # 3. Run training
+    # 2. Run training
     python scripts/fashioniq/train.py --category dress --epochs 5
 
     # Run all categories
@@ -29,20 +28,82 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 # khoji imports — reuse what we can
 from khoji.device import get_device
+from khoji.image_utils import load_image
 from khoji.lora import LoRASettings, apply_lora
 from khoji.loss import infonce_loss, triplet_margin_loss
-from khoji.metrics import mrr_at_k, ndcg_at_k, recall_at_k
+from khoji.metrics import mrr_at_k, recall_at_k
 from khoji.trainer import TrainHistory
 
 
 # ──────────────────────────────────────────────────────────
 # Data loading
 # ──────────────────────────────────────────────────────────
+
+CATEGORIES = ["dress", "shirt", "toptee"]
+
+URL_MAP_BASE = (
+    "https://raw.githubusercontent.com/"
+    "hongwang600/fashion-iq-metadata/master/image_url"
+)
+
+
+def load_url_mapping(data_dir: Path, category: str) -> dict[str, str]:
+    """Load ASIN → image URL mapping for a category.
+
+    Downloads from GitHub on first call, caches locally.
+    """
+    cache_file = data_dir / "image_url" / f"asin2url.{category}.txt"
+    if not cache_file.exists():
+        from urllib.request import urlretrieve
+
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{URL_MAP_BASE}/asin2url.{category}.txt"
+        print(f"  Downloading URL mapping: {url}")
+        urlretrieve(url, cache_file)
+
+    mapping = {}
+    with open(cache_file) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 2:
+                asin = parts[0].strip()
+                url = parts[1].strip()
+                mapping[asin] = url
+
+    return mapping
+
+
+def load_image_by_id(
+    image_id: str,
+    url_mapping: dict[str, str],
+    cache_dir: Path | None = None,
+) -> Image.Image | None:
+    """Load an image by ASIN — from cache or URL."""
+    # Try local cache first
+    if cache_dir is not None:
+        for ext in [".jpg", ".jpeg", ".png"]:
+            local = cache_dir / f"{image_id}{ext}"
+            if local.exists():
+                try:
+                    return Image.open(local).convert("RGB")
+                except Exception:
+                    pass
+
+    # Load from URL
+    url = url_mapping.get(image_id)
+    if url is None:
+        return None
+
+    try:
+        img = load_image(url, cache_dir=str(cache_dir) if cache_dir else None)
+        return img.convert("RGB") if img else None
+    except Exception:
+        return None
 
 
 @dataclass
@@ -77,17 +138,13 @@ def load_fashioniq(
 
     Returns:
         (annotations, gallery_image_ids)
-        annotations: list of {candidate, target, captions}
-        gallery_image_ids: all image IDs in this split
     """
     data_path = Path(data_dir)
 
-    # Load annotations
     cap_file = data_path / "captions" / f"cap.{category}.{split}.json"
     with open(cap_file) as f:
         annotations = json.load(f)
 
-    # Load gallery image IDs
     split_file = data_path / "image_splits" / f"split.{category}.{split}.json"
     with open(split_file) as f:
         gallery_ids = json.load(f)
@@ -97,18 +154,6 @@ def load_fashioniq(
         f"{len(annotations)} annotations, {len(gallery_ids)} gallery images"
     )
     return annotations, gallery_ids
-
-
-def load_image_by_id(
-    image_id: str, images_dir: Path
-) -> Image.Image | None:
-    """Load an image by its product ID."""
-    # Try common extensions
-    for ext in [".jpg", ".jpeg", ".png"]:
-        path = images_dir / f"{image_id}{ext}"
-        if path.exists():
-            return Image.open(path).convert("RGB")
-    return None
 
 
 def build_triplets(
@@ -133,7 +178,9 @@ def build_triplets(
         ]
 
         for caption in ann["captions"]:
-            neg_ids = rng.sample(non_targets, min(n_negatives, len(non_targets)))
+            neg_ids = rng.sample(
+                non_targets, min(n_negatives, len(non_targets))
+            )
             for neg_id in neg_ids:
                 triplets.append(ComposedTriplet(
                     candidate_id=candidate_id,
@@ -156,7 +203,7 @@ class ComposedRetrievalModel:
     """BLIP-2 Q-Former wrapper for composed image retrieval.
 
     encode_composed(image, text) → embedding (query)
-    encode_image(image) → embedding (target)
+    encode_images(images) → embeddings (targets)
 
     Both return vectors in the same Q-Former embedding space.
     """
@@ -174,9 +221,7 @@ class ComposedRetrievalModel:
         self.model = Blip2Model.from_pretrained(model_name).to(self.device)
         self.model_name = model_name
 
-        # Apply LoRA to Q-Former
         if lora is not None:
-            # Target the Q-Former's cross-attention and self-attention
             self.model = apply_lora(self.model, lora)
 
         total = sum(p.numel() for p in self.model.parameters())
@@ -194,7 +239,7 @@ class ComposedRetrievalModel:
         images: list[Image.Image],
         texts: list[str],
     ) -> torch.Tensor:
-        """Encode (image, text) pairs → joint embeddings via Q-Former.
+        """Encode (image, text) pairs → joint embeddings.
 
         Returns:
             (batch, embed_dim) tensor, L2-normalized.
@@ -205,17 +250,17 @@ class ComposedRetrievalModel:
         ).to(self.device)
 
         qformer_out = self.model.get_qformer_features(**inputs)
-        # qformer_out: (batch, 32, 768) — mean pool the 32 query tokens
         embeddings = qformer_out.mean(dim=1)
         return F.normalize(embeddings, p=2, dim=1)
 
+    @torch.no_grad()
     def encode_images(
         self,
         images: list[Image.Image],
         batch_size: int = 32,
         show_progress: bool = True,
     ) -> torch.Tensor:
-        """Encode images → embeddings via Q-Former (no text).
+        """Encode images → embeddings (no text).
 
         Returns:
             (n_images, embed_dim) tensor, L2-normalized.
@@ -231,8 +276,7 @@ class ComposedRetrievalModel:
                 images=batch_images, return_tensors="pt",
             ).to(self.device)
 
-            with torch.no_grad():
-                qformer_out = self.model.get_qformer_features(**inputs)
+            qformer_out = self.model.get_qformer_features(**inputs)
             embeddings = qformer_out.mean(dim=1)
             embeddings = F.normalize(embeddings, p=2, dim=1)
             all_embeddings.append(embeddings.cpu())
@@ -248,7 +292,8 @@ class ComposedRetrievalModel:
 def train_composed(
     model: ComposedRetrievalModel,
     triplets: list[ComposedTriplet],
-    images_dir: Path,
+    url_mapping: dict[str, str],
+    cache_dir: Path | None = None,
     epochs: int = 5,
     batch_size: int = 8,
     lr: float = 2e-5,
@@ -260,20 +305,16 @@ def train_composed(
     device = model.device
     history = TrainHistory()
 
-    # Loss function
     if loss_type == "infonce":
         loss_fn = partial(infonce_loss, temperature=temperature)
     else:
         loss_fn = partial(triplet_margin_loss, margin=0.2)
 
-    # Optimizer — only trainable params (LoRA)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.model.parameters()),
-        lr=lr,
-        weight_decay=0.01,
+        lr=lr, weight_decay=0.01,
     )
 
-    # LR scheduler
     total_steps = (len(triplets) // batch_size) * epochs
     warmup = min(warmup_steps, total_steps // 5)
 
@@ -286,7 +327,6 @@ def train_composed(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Training loop
     model.model.train()
     dataset = ComposedTripletDataset(triplets)
 
@@ -295,7 +335,6 @@ def train_composed(
         f"(batch_size={batch_size}, lr={lr})"
     )
 
-    global_step = 0
     pbar = tqdm(
         total=len(triplets) * epochs // batch_size,
         desc="Training", unit="batch",
@@ -304,8 +343,6 @@ def train_composed(
     for epoch in range(epochs):
         epoch_loss = 0.0
         epoch_batches = 0
-
-        # Shuffle
         indices = list(range(len(dataset)))
         random.shuffle(indices)
 
@@ -316,20 +353,20 @@ def train_composed(
 
             batch = [dataset[i] for i in batch_indices]
 
-            # Load images
+            # Load images via URL (with caching)
             candidate_imgs = []
             target_imgs = []
             negative_imgs = []
             captions = []
-            skip = False
+            valid = True
 
             for t in batch:
-                c_img = load_image_by_id(t.candidate_id, images_dir)
-                t_img = load_image_by_id(t.target_id, images_dir)
-                n_img = load_image_by_id(t.negative_id, images_dir)
+                c_img = load_image_by_id(t.candidate_id, url_mapping, cache_dir)
+                t_img = load_image_by_id(t.target_id, url_mapping, cache_dir)
+                n_img = load_image_by_id(t.negative_id, url_mapping, cache_dir)
 
                 if c_img is None or t_img is None or n_img is None:
-                    skip = True
+                    valid = False
                     break
 
                 candidate_imgs.append(c_img)
@@ -337,18 +374,13 @@ def train_composed(
                 negative_imgs.append(n_img)
                 captions.append(t.caption)
 
-            if skip:
+            if not valid:
                 continue
 
             # Encode query: (candidate_image, caption) → embedding
             query_emb = model.encode_composed(candidate_imgs, captions)
 
-            # Encode targets and negatives: image → embedding
-            with torch.no_grad():
-                # Detach is wrong here — we need gradients through target encoding
-                pass
-
-            # Re-encode with gradients for contrastive learning
+            # Encode targets and negatives
             target_inputs = model.processor(
                 images=target_imgs, return_tensors="pt",
             ).to(device)
@@ -361,7 +393,6 @@ def train_composed(
             neg_qf = model.model.get_qformer_features(**neg_inputs)
             neg_emb = F.normalize(neg_qf.mean(dim=1), p=2, dim=1)
 
-            # Compute loss
             loss = loss_fn(query_emb, target_emb, neg_emb)
 
             optimizer.zero_grad()
@@ -375,7 +406,6 @@ def train_composed(
             batch_loss = loss.item()
             epoch_loss += batch_loss
             epoch_batches += 1
-            global_step += 1
 
             history.step_loss.append(batch_loss)
             history.step_lr.append(scheduler.get_last_lr()[0])
@@ -388,7 +418,9 @@ def train_composed(
 
         avg_loss = epoch_loss / max(epoch_batches, 1)
         history.epoch_loss.append(avg_loss)
-        tqdm.write(f"  Epoch {epoch + 1}/{epochs} | Avg Loss: {avg_loss:.4f}")
+        tqdm.write(
+            f"  Epoch {epoch + 1}/{epochs} | Avg Loss: {avg_loss:.4f}"
+        )
 
     pbar.close()
     return history
@@ -404,34 +436,35 @@ def evaluate_composed(
     model: ComposedRetrievalModel,
     annotations: list[dict],
     gallery_ids: list[str],
-    images_dir: Path,
+    url_mapping: dict[str, str],
+    cache_dir: Path | None = None,
     k_values: list[int] | None = None,
     max_queries: int | None = None,
 ) -> dict[str, float]:
-    """Evaluate composed retrieval: Recall@k over the gallery.
-
-    For each (candidate_image, caption) query, rank all gallery images
-    and check if the target is in top-k.
-    """
+    """Evaluate composed retrieval: Recall@k and MRR@k over the gallery."""
     if k_values is None:
         k_values = [1, 5, 10, 50]
 
     model.model.eval()
 
     # Pre-encode all gallery images
-    print(f"Encoding {len(gallery_ids)} gallery images...")
+    print(f"Loading and encoding {len(gallery_ids)} gallery images...")
     gallery_images = []
     valid_gallery_ids = []
-    for gid in gallery_ids:
-        img = load_image_by_id(gid, images_dir)
+    for gid in tqdm(gallery_ids, desc="Loading gallery"):
+        img = load_image_by_id(gid, url_mapping, cache_dir)
         if img is not None:
             gallery_images.append(img)
             valid_gallery_ids.append(gid)
 
+    print(
+        f"Loaded {len(valid_gallery_ids)}/{len(gallery_ids)} gallery images"
+    )
     gallery_embeddings = model.encode_images(gallery_images)
-    gallery_id_to_idx = {gid: i for i, gid in enumerate(valid_gallery_ids)}
+    gallery_id_to_idx = {
+        gid: i for i, gid in enumerate(valid_gallery_ids)
+    }
 
-    # Evaluate queries
     if max_queries is not None:
         annotations = annotations[:max_queries]
 
@@ -450,22 +483,17 @@ def evaluate_composed(
         if target_id not in gallery_id_to_idx:
             continue
 
-        c_img = load_image_by_id(candidate_id, images_dir)
+        c_img = load_image_by_id(candidate_id, url_mapping, cache_dir)
         if c_img is None:
             continue
 
-        # Use first caption as query
         caption = ann["captions"][0]
-
-        # Encode query
         query_emb = model.encode_composed([c_img], [caption])
 
-        # Rank gallery
         scores = torch.mm(query_emb, gallery_embeddings.t()).squeeze(0)
         ranked_indices = torch.argsort(scores, descending=True).tolist()
         ranked_ids = [valid_gallery_ids[i] for i in ranked_indices]
 
-        # Compute metrics
         qrel = {target_id: 1}
         for k in k_values:
             metric_sums[f"recall@{k}"] += recall_at_k(ranked_ids, qrel, k)
@@ -473,12 +501,14 @@ def evaluate_composed(
 
         n_queries += 1
 
-    # Average
     metrics = {}
     for key, total in metric_sums.items():
         metrics[key] = round(total / max(n_queries, 1), 4)
 
-    print(f"\nResults ({n_queries} queries, {len(valid_gallery_ids)} gallery):")
+    print(
+        f"\nResults ({n_queries} queries, "
+        f"{len(valid_gallery_ids)} gallery):"
+    )
     print(f"{'Metric':<12} {'Value':>8}")
     print("-" * 22)
     for k, v in metrics.items():
@@ -495,7 +525,7 @@ def evaluate_composed(
 def run_experiment(
     category: str,
     data_dir: str = "./data/fashioniq",
-    images_dir: str = "./data/fashioniq/images",
+    cache_dir: str = "./data/fashioniq/image_cache",
     epochs: int = 5,
     batch_size: int = 8,
     lr: float = 2e-5,
@@ -504,19 +534,27 @@ def run_experiment(
     max_eval_queries: int | None = 100,
     output_dir: str = "./output/fashioniq",
 ):
-    """Run a complete composed retrieval experiment on one category."""
-    images_path = Path(images_dir)
+    """Run a complete composed retrieval experiment."""
+    data_path = Path(data_dir)
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
     out_path = Path(output_dir) / category
     out_path.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#' * 60}")
     print(f"# FashionIQ Composed Retrieval: {category.upper()}")
     print(f"# Model: BLIP-2 Q-Former + LoRA (r={lora_r})")
+    print(f"# Images: loaded via URL, cached to {cache_dir}")
     print(f"{'#' * 60}")
 
-    # Load data
+    # Load annotations
     train_anns, train_gallery = load_fashioniq(data_dir, category, "train")
     val_anns, val_gallery = load_fashioniq(data_dir, category, "val")
+
+    # Load URL mapping
+    print("\nLoading image URL mapping...")
+    url_mapping = load_url_mapping(data_path, category)
+    print(f"  {len(url_mapping)} image URLs loaded")
 
     # Build model
     lora = LoRASettings(r=lora_r, alpha=lora_r * 2, dropout=0.1)
@@ -525,25 +563,27 @@ def run_experiment(
     # Baseline evaluation
     print("\n--- Baseline Evaluation ---")
     baseline = evaluate_composed(
-        model, val_anns, val_gallery, images_path,
-        max_queries=max_eval_queries,
+        model, val_anns, val_gallery, url_mapping,
+        cache_dir=cache_path, max_queries=max_eval_queries,
     )
 
     # Build triplets and train
-    triplets = build_triplets(train_anns, train_gallery, n_negatives=n_negatives)
+    triplets = build_triplets(
+        train_anns, train_gallery, n_negatives=n_negatives
+    )
     history = train_composed(
-        model, triplets, images_path,
+        model, triplets, url_mapping,
+        cache_dir=cache_path,
         epochs=epochs, batch_size=batch_size, lr=lr,
     )
 
-    # Save training history
     history.save(str(out_path / "train_history.json"))
 
     # Fine-tuned evaluation
     print("\n--- Fine-tuned Evaluation ---")
     finetuned = evaluate_composed(
-        model, val_anns, val_gallery, images_path,
-        max_queries=max_eval_queries,
+        model, val_anns, val_gallery, url_mapping,
+        cache_dir=cache_path, max_queries=max_eval_queries,
     )
 
     # Comparison
@@ -573,7 +613,9 @@ def main():
         choices=["dress", "shirt", "toptee", "all"],
     )
     parser.add_argument("--data-dir", default="./data/fashioniq")
-    parser.add_argument("--images-dir", default="./data/fashioniq/images")
+    parser.add_argument(
+        "--cache-dir", default="./data/fashioniq/image_cache",
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -584,16 +626,14 @@ def main():
     args = parser.parse_args()
 
     categories = (
-        ["dress", "shirt", "toptee"]
-        if args.category == "all"
-        else [args.category]
+        CATEGORIES if args.category == "all" else [args.category]
     )
 
     for cat in categories:
         run_experiment(
             category=cat,
             data_dir=args.data_dir,
-            images_dir=args.images_dir,
+            cache_dir=args.cache_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
