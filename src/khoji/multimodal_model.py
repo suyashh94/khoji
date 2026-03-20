@@ -14,7 +14,7 @@ from khoji.model import _resolve_dtype
 
 
 def _detect_model_type(model_name: str) -> str:
-    """Detect whether a HuggingFace model is CLIP, SigLIP, etc."""
+    """Detect whether a HuggingFace model is CLIP, SigLIP, BLIP-2, etc."""
     from transformers import AutoConfig
 
     try:
@@ -89,7 +89,14 @@ class MultimodalEmbeddingModel:
         elif model_name is not None:
             # HuggingFace model path
             self.model_type = _detect_model_type(model_name)
-            self._load_hf_model(model_name, adapter_path, dtype, preprocess_overrides)
+            if self.model_type == "blip-2":
+                self._load_blip2_model(
+                    model_name, adapter_path, dtype
+                )
+            else:
+                self._load_hf_model(
+                    model_name, adapter_path, dtype, preprocess_overrides
+                )
             # Allow custom image_processor to override the auto-detected one
             if image_processor is not None:
                 self.image_processor = image_processor
@@ -156,6 +163,133 @@ class MultimodalEmbeddingModel:
             f"Loaded {model_name}{adapter_str} | "
             f"type: {self.model_type} | device: {self.device}{dtype_str}"
         )
+
+    def _load_blip2_model(
+        self,
+        model_name: str,
+        adapter_path: str | None,
+        dtype: str | None,
+    ) -> None:
+        """Load a BLIP-2 model with Q-Former for joint image+text encoding."""
+        from transformers import AutoProcessor, Blip2Model
+
+        load_kwargs = {}
+        if self._torch_dtype is not None:
+            load_kwargs["torch_dtype"] = self._torch_dtype
+
+        model = Blip2Model.from_pretrained(model_name, **load_kwargs)
+
+        if adapter_path is not None:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, adapter_path)
+            model = model.merge_and_unload()
+
+        model = model.to(self.device)
+        model.eval()
+        self._full_model = model
+        self._blip2_processor = AutoProcessor.from_pretrained(model_name)
+
+        self.text_encoder = None
+        self.vision_encoder = None
+        self.text_projection = None
+        self.visual_projection = None
+        self.tokenizer = self._blip2_processor.tokenizer
+        self.image_processor = self._blip2_processor.image_processor
+
+        dtype_str = f" | dtype: {dtype}" if dtype else ""
+        adapter_str = (
+            f" + adapter from {adapter_path}" if adapter_path else ""
+        )
+        print(
+            f"Loaded {model_name}{adapter_str} | "
+            f"type: blip-2 (Q-Former) | device: {self.device}{dtype_str}"
+        )
+
+    @torch.no_grad()
+    def encode(
+        self,
+        images: list[Image.Image] | None = None,
+        texts: list[str] | None = None,
+        batch_size: int = 64,
+        show_progress: bool = True,
+    ) -> torch.Tensor:
+        """Unified encoding: image-only, text-only, or joint image+text.
+
+        For BLIP-2: passes both through the Q-Former for joint encoding.
+        For CLIP/SigLIP: encodes separately; joint falls back to additive fusion.
+
+        Args:
+            images: List of PIL images. None for text-only.
+            texts: List of text strings. None for image-only.
+            batch_size: Batch size for encoding.
+            show_progress: Show progress bar.
+
+        Returns:
+            L2-normalized tensor of shape (N, embedding_dim).
+        """
+        if images is None and texts is None:
+            raise ValueError("Provide at least one of images or texts.")
+
+        if self.model_type == "blip-2":
+            return self._encode_blip2(
+                images, texts, batch_size, show_progress
+            )
+
+        # CLIP/SigLIP fallback
+        if images is not None and texts is not None:
+            img_emb = self.encode_images(images, batch_size, show_progress)
+            txt_emb = self.encode_text(texts, batch_size, show_progress)
+            fused = img_emb + txt_emb
+            return torch.nn.functional.normalize(fused, p=2, dim=1)
+        elif images is not None:
+            return self.encode_images(images, batch_size, show_progress)
+        else:
+            return self.encode_text(texts, batch_size, show_progress)
+
+    @torch.no_grad()
+    def _encode_blip2(
+        self,
+        images: list[Image.Image] | None,
+        texts: list[str] | None,
+        batch_size: int,
+        show_progress: bool,
+    ) -> torch.Tensor:
+        """Encode via BLIP-2 Q-Former — supports joint image+text."""
+        n = len(images) if images is not None else len(texts)  # type: ignore
+        all_embeddings = []
+        iterator = range(0, n, batch_size)
+        if show_progress and n > batch_size:
+            iterator = tqdm(iterator, desc="Encoding", unit="batch")
+
+        for start in iterator:
+            kwargs = {}
+            if images is not None:
+                batch_imgs = images[start: start + batch_size]
+                proc = self._blip2_processor(
+                    images=batch_imgs, return_tensors="pt",
+                )
+                kwargs["pixel_values"] = proc["pixel_values"].to(self.device)
+
+            if texts is not None:
+                batch_texts = texts[start: start + batch_size]
+                tok = self._blip2_processor.tokenizer(
+                    batch_texts, padding=True, truncation=True,
+                    max_length=self.max_length, return_tensors="pt",
+                )
+                kwargs["input_ids"] = tok["input_ids"].to(self.device)
+                kwargs["attention_mask"] = (
+                    tok["attention_mask"].to(self.device)
+                )
+
+            qformer_out = self._full_model.get_qformer_features(**kwargs)
+            embeddings = qformer_out.mean(dim=1)
+            embeddings = torch.nn.functional.normalize(
+                embeddings, p=2, dim=1
+            )
+            all_embeddings.append(embeddings.cpu())
+
+        return torch.cat(all_embeddings, dim=0)
 
     @torch.no_grad()
     def encode_text(
