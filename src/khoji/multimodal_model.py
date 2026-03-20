@@ -196,13 +196,15 @@ class MultimodalEmbeddingModel:
         dtype: str | None,
     ) -> None:
         """Load a BLIP-2 model with Q-Former for joint image+text encoding."""
-        from transformers import AutoProcessor, Blip2Model
+        from transformers import AutoProcessor, Blip2ForImageTextRetrieval
 
         load_kwargs = {}
         if self._torch_dtype is not None:
             load_kwargs["torch_dtype"] = self._torch_dtype
 
-        model = Blip2Model.from_pretrained(model_name, **load_kwargs)
+        model = Blip2ForImageTextRetrieval.from_pretrained(
+            model_name, **load_kwargs
+        )
 
         if adapter_path is not None:
             from peft import PeftModel
@@ -287,35 +289,58 @@ class MultimodalEmbeddingModel:
         batch_size: int,
         show_progress: bool,
     ) -> torch.Tensor:
-        """Encode via BLIP-2 Q-Former — supports joint image+text."""
+        """Encode via BLIP-2 — supports joint image+text in 256-dim space.
+
+        Uses Blip2ForImageTextRetrieval in ITC mode:
+        - image_embeds: (batch, 32, 256) → max-pool → (batch, 256)
+        - text_embeds: (batch, 256)
+        - Joint: normalize(image_embeds + text_embeds)
+        """
         n = len(images) if images is not None else len(texts)  # type: ignore
+        joint_mode = images is not None and texts is not None
         all_embeddings = []
         iterator = range(0, n, batch_size)
         if show_progress and n > batch_size:
             iterator = tqdm(iterator, desc="Encoding", unit="batch")
 
         for start in iterator:
-            kwargs = {}
+            batch_size_actual = min(batch_size, n - start)
+
+            # Build inputs — model requires both pixel_values and input_ids
             if images is not None:
-                batch_imgs = images[start: start + batch_size]
-                proc = self._blip2_processor(
-                    images=batch_imgs, return_tensors="pt",
+                batch_imgs = images[start: start + batch_size_actual]
+                batch_texts = (
+                    texts[start: start + batch_size_actual]
+                    if texts is not None
+                    else [""] * len(batch_imgs)
                 )
-                kwargs["pixel_values"] = proc["pixel_values"].to(self.device)
+            else:
+                # Text-only: need a dummy image (BLIP-2 requires pixel_values)
+                dummy = Image.new("RGB", (224, 224), "black")
+                batch_imgs = [dummy] * batch_size_actual
+                batch_texts = texts[start: start + batch_size_actual]  # type: ignore
 
-            if texts is not None:
-                batch_texts = texts[start: start + batch_size]
-                tok = self._blip2_processor.tokenizer(
-                    batch_texts, padding=True, truncation=True,
-                    max_length=self.max_length, return_tensors="pt",
-                )
-                kwargs["input_ids"] = tok["input_ids"].to(self.device)
-                kwargs["attention_mask"] = (
-                    tok["attention_mask"].to(self.device)
-                )
+            inputs = self._blip2_processor(
+                images=batch_imgs, text=batch_texts,
+                return_tensors="pt", padding=True, truncation=True,
+            ).to(self.device)
 
-            qformer_out = self._full_model.get_qformer_features(**kwargs)
-            embeddings = qformer_out.mean(dim=1)
+            out = self._full_model(
+                **inputs, use_image_text_matching_head=False,
+            )
+
+            if joint_mode:
+                # Fuse image + text in the shared 256-dim space
+                img_emb = out.image_embeds.max(dim=1).values
+                txt_emb = out.text_embeds
+                embeddings = img_emb + txt_emb
+            elif images is not None:
+                # Image-only: max-pool over 32 Q-Former query tokens
+                embeddings = out.image_embeds.max(dim=1).values
+            else:
+                # Text-only
+                embeddings = out.text_embeds
+
             embeddings = torch.nn.functional.normalize(
                 embeddings, p=2, dim=1
             )
