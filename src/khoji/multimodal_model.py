@@ -2,12 +2,11 @@
 
 Two model classes for different retrieval paradigms:
 
-- ``MultimodalEmbeddingModel``: Separate text and image encoders (CLIP, SigLIP).
-  For text-to-image retrieval where queries are text and documents are images.
+- ``MultimodalEmbeddingModel``: Separate text and image encoders (CLIP, SigLIP,
+  or user-provided callables). For text-to-image retrieval.
 
 - ``JointEmbeddingModel``: Single encoder that handles text, images, or both
-  together (BLIP-2, or any custom model with joint encoding).
-  For composed image retrieval where queries are (image + text).
+  together (BLIP-2, or user-provided callable). For composed image retrieval.
 """
 
 from __future__ import annotations
@@ -42,36 +41,47 @@ def _detect_model_type(model_name: str) -> str:
 class MultimodalEmbeddingModel:
     """Separate text and image encoders for cross-modal retrieval.
 
-    For CLIP, SigLIP, and custom dual-encoder models where text and
-    images are encoded independently.
-
-    **HuggingFace models:**
+    **HuggingFace models** (CLIP/SigLIP — auto-detected):
 
         model = MultimodalEmbeddingModel("openai/clip-vit-base-patch32")
         text_emb = model.encode_text(["a red dress"])
         img_emb = model.encode_images([pil_image])
 
-    **Custom models:**
+    **Custom encoders** — provide your own encode functions:
 
         model = MultimodalEmbeddingModel(
-            text_model=my_text_encoder,
-            vision_model=my_vision_encoder,
-            tokenizer=my_tokenizer,
-            image_processor=my_processor,
+            text_encoder=my_text_fn,    # (texts: list[str]) -> Tensor
+            image_encoder=my_image_fn,  # (images: list[PIL.Image]) -> Tensor
         )
+
+    The encode functions should return L2-normalized tensors of shape
+    (batch, embedding_dim). Both must produce embeddings in the same
+    space for cosine similarity to work.
+
+    Args:
+        model_name: HuggingFace model ID (CLIP or SigLIP). Auto-detects
+            architecture, tokenizer, and image preprocessor.
+        adapter_path: Path to saved LoRA adapter weights.
+        text_encoder: Custom text encoding function.
+            Signature: ``(texts: list[str]) -> Tensor``.
+        image_encoder: Custom image encoding function.
+            Signature: ``(images: list[PIL.Image]) -> Tensor``.
+        device: Device to use. None = auto-detect.
+        preprocess_overrides: Dict with optional keys: image_size, mean, std.
+            Only used with HuggingFace models.
+        max_length: Maximum token length for text inputs.
+        dtype: Load base model in "fp16", "bf16", or None (fp32).
     """
 
     def __init__(
         self,
         model_name: str | None = None,
         adapter_path: str | None = None,
-        device: torch.device | None = None,
-        text_model: torch.nn.Module | None = None,
-        vision_model: torch.nn.Module | None = None,
-        tokenizer: object | None = None,
-        image_processor: (
+        text_encoder: Callable[[list[str]], torch.Tensor] | None = None,
+        image_encoder: (
             Callable[[list[Image.Image]], torch.Tensor] | None
         ) = None,
+        device: torch.device | None = None,
         preprocess_overrides: dict | None = None,
         max_length: int = 77,
         dtype: str | None = None,
@@ -79,42 +89,29 @@ class MultimodalEmbeddingModel:
         self.device = device or get_device()
         self.max_length = max_length
         self._torch_dtype = _resolve_dtype(dtype)
+        self._full_model = None
+        self.model_type = "custom"
 
-        if text_model is not None and vision_model is not None:
-            if tokenizer is None:
-                raise ValueError(
-                    "Must provide tokenizer with custom models."
-                )
-            if image_processor is None:
-                raise ValueError(
-                    "Must provide image_processor with custom models."
-                )
-            self.text_encoder = text_model.to(self.device)
-            self.vision_encoder = vision_model.to(self.device)
-            self.tokenizer = tokenizer
-            self.image_processor = image_processor
-            self.model_type = "custom"
-            self._full_model = None
-            self.text_projection = None
-            self.visual_projection = None
-            dtype_str = f" | dtype: {dtype}" if dtype else ""
+        if text_encoder is not None and image_encoder is not None:
+            # Custom encoder path
+            self._text_encoder_fn = text_encoder
+            self._image_encoder_fn = image_encoder
             print(
-                f"Loaded custom multimodal model | "
-                f"device: {self.device}{dtype_str}"
+                f"Loaded custom multimodal encoders | "
+                f"device: {self.device}"
             )
 
         elif model_name is not None:
+            # HuggingFace model path
             self.model_type = _detect_model_type(model_name)
             self._load_hf_model(
                 model_name, adapter_path, dtype, preprocess_overrides
             )
-            if image_processor is not None:
-                self.image_processor = image_processor
 
         else:
             raise ValueError(
                 "Provide either model_name or "
-                "(text_model + vision_model)."
+                "(text_encoder + image_encoder)."
             )
 
     def _load_hf_model(
@@ -124,7 +121,7 @@ class MultimodalEmbeddingModel:
         dtype: str | None,
         preprocess_overrides: dict | None,
     ) -> None:
-        """Load a CLIP or SigLIP model from HuggingFace."""
+        """Load CLIP/SigLIP and wire up encoder functions."""
         from transformers import AutoModel, AutoTokenizer
 
         load_kwargs = {}
@@ -133,13 +130,11 @@ class MultimodalEmbeddingModel:
 
         if self.model_type == "clip":
             from transformers import CLIPModel
-
             full_model = CLIPModel.from_pretrained(
                 model_name, **load_kwargs
             )
         elif self.model_type == "siglip":
             from transformers import SiglipModel
-
             full_model = SiglipModel.from_pretrained(
                 model_name, **load_kwargs
             )
@@ -150,7 +145,6 @@ class MultimodalEmbeddingModel:
 
         if adapter_path is not None:
             from peft import PeftModel
-
             full_model = PeftModel.from_pretrained(
                 full_model, adapter_path
             )
@@ -160,19 +154,45 @@ class MultimodalEmbeddingModel:
         full_model.eval()
         self._full_model = full_model
 
-        self.text_encoder = full_model.text_model
-        self.vision_encoder = full_model.vision_model
-        self.text_projection = getattr(
-            full_model, "text_projection", None
-        )
-        self.visual_projection = getattr(
-            full_model, "visual_projection", None
-        )
+        # Extract sub-models and projections
+        text_model = full_model.text_model
+        vision_model = full_model.vision_model
+        text_proj = getattr(full_model, "text_projection", None)
+        visual_proj = getattr(full_model, "visual_projection", None)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.image_processor = build_image_processor(
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        image_processor = build_image_processor(
             model_name=model_name, overrides=preprocess_overrides,
         )
+
+        # Wire up encoder functions using closures
+        device = self.device
+        max_length = self.max_length
+
+        def _encode_text(texts: list[str]) -> torch.Tensor:
+            encoded = tokenizer(
+                texts, padding=True, truncation=True,
+                max_length=max_length, return_tensors="pt",
+            ).to(device)
+            outputs = text_model(**encoded)
+            pooled = outputs.pooler_output
+            if text_proj is not None:
+                return text_proj(pooled)
+            return pooled
+
+        def _encode_images(images: list[Image.Image]) -> torch.Tensor:
+            pixel_values = image_processor(images).to(device)
+            outputs = vision_model(pixel_values=pixel_values)
+            pooled = outputs.pooler_output
+            if visual_proj is not None:
+                return visual_proj(pooled)
+            return pooled
+
+        self._text_encoder_fn = _encode_text
+        self._image_encoder_fn = _encode_images
+        # Expose for trainer/evaluator that need direct access
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
 
         dtype_str = f" | dtype: {dtype}" if dtype else ""
         adapter_str = (
@@ -198,13 +218,8 @@ class MultimodalEmbeddingModel:
             iterator = tqdm(iterator, desc="Encoding text", unit="batch")
 
         for i in iterator:
-            batch_texts = texts[i: i + batch_size]
-            encoded = self.tokenizer(
-                batch_texts, padding=True, truncation=True,
-                max_length=self.max_length, return_tensors="pt",
-            ).to(self.device)
-
-            embeddings = self._extract_text_features(encoded)
+            batch = texts[i: i + batch_size]
+            embeddings = self._text_encoder_fn(batch)
             embeddings = torch.nn.functional.normalize(
                 embeddings, p=2, dim=1
             )
@@ -228,12 +243,8 @@ class MultimodalEmbeddingModel:
             )
 
         for i in iterator:
-            batch_images = images[i: i + batch_size]
-            pixel_values = self.image_processor(batch_images).to(
-                self.device
-            )
-
-            embeddings = self._extract_image_features(pixel_values)
+            batch = images[i: i + batch_size]
+            embeddings = self._image_encoder_fn(batch)
             embeddings = torch.nn.functional.normalize(
                 embeddings, p=2, dim=1
             )
@@ -263,63 +274,13 @@ class MultimodalEmbeddingModel:
             batch_images = load_images_batch(
                 batch_sources, base_dir=base_dir, cache_dir=cache_dir
             )
-            pixel_values = self.image_processor(batch_images).to(
-                self.device
-            )
-
-            embeddings = self._extract_image_features(pixel_values)
+            embeddings = self._image_encoder_fn(batch_images)
             embeddings = torch.nn.functional.normalize(
                 embeddings, p=2, dim=1
             )
             all_embeddings.append(embeddings.cpu())
 
         return torch.cat(all_embeddings, dim=0)
-
-    def _extract_text_features(self, encoded: dict) -> torch.Tensor:
-        """Extract text embeddings from tokenized inputs."""
-        if (
-            self.model_type in ("clip", "siglip")
-            and self._full_model is not None
-        ):
-            outputs = self.text_encoder(**encoded)
-            pooled = outputs.pooler_output
-            if self.text_projection is not None:
-                return self.text_projection(pooled)
-            return pooled
-        else:
-            outputs = self.text_encoder(**encoded)
-            if (
-                hasattr(outputs, "pooler_output")
-                and outputs.pooler_output is not None
-            ):
-                return outputs.pooler_output
-            if hasattr(outputs, "last_hidden_state"):
-                return outputs.last_hidden_state[:, 0, :]
-            return outputs
-
-    def _extract_image_features(
-        self, pixel_values: torch.Tensor
-    ) -> torch.Tensor:
-        """Extract image embeddings from pixel values."""
-        if (
-            self.model_type in ("clip", "siglip")
-            and self._full_model is not None
-        ):
-            outputs = self.vision_encoder(pixel_values=pixel_values)
-            pooled = outputs.pooler_output
-            if self.visual_projection is not None:
-                return self.visual_projection(pooled)
-            return pooled
-        else:
-            outputs = self.vision_encoder(pixel_values)
-            if (
-                hasattr(outputs, "pooler_output")
-                and outputs.pooler_output is not None
-            ):
-                return outputs.pooler_output
-            if hasattr(outputs, "last_hidden_state"):
-                return outputs.last_hidden_state[:, 0, :]
-            return outputs
 
 
 # ──────────────────────────────────────────────────────────────
@@ -343,10 +304,10 @@ class JointEmbeddingModel:
 
         model = JointEmbeddingModel("Salesforce/blip2-itm-vit-g")
 
-    **Custom model:**
+    **Custom encoder:**
 
         model = JointEmbeddingModel(
-            encoder=my_encode_fn,  # (images, texts, device) -> tensor
+            encoder=my_fn,  # (images, texts, device) -> tensor
         )
 
     Args:
@@ -419,7 +380,6 @@ class JointEmbeddingModel:
 
         if adapter_path is not None:
             from peft import PeftModel
-
             model = PeftModel.from_pretrained(model, adapter_path)
             model = model.merge_and_unload()
 
