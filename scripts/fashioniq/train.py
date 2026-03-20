@@ -108,8 +108,8 @@ class ComposedTriplet:
     negative_id: str
 
 
-def build_triplets(annotations, gallery_ids, n_negatives=1, seed=42):
-    """Build composed retrieval triplets (2 captions per annotation)."""
+def build_random_triplets(annotations, gallery_ids, n_negatives=1, seed=42):
+    """Build composed triplets with random negatives."""
     rng = random.Random(seed)
     triplets = []
     for ann in annotations:
@@ -128,8 +128,120 @@ def build_triplets(annotations, gallery_ids, n_negatives=1, seed=42):
                     negative_id=neg_id,
                 ))
     rng.shuffle(triplets)
-    print(f"Built {len(triplets)} composed triplets")
+    print(f"Built {len(triplets)} random composed triplets")
     return triplets
+
+
+@torch.no_grad()
+def mine_hard_triplets(
+    model, annotations, gallery_ids, url_mapping,
+    cache_dir=None, n_negatives=1, top_k=50, skip_top=0, seed=42,
+):
+    """Mine hard negatives for composed retrieval.
+
+    Encodes all (candidate, caption) queries and all gallery images,
+    then finds the most similar non-target images as hard negatives.
+    """
+    model._full_model.eval()
+    rng = random.Random(seed)
+
+    # Encode gallery images
+    print(f"Encoding {len(gallery_ids)} gallery images for mining...")
+    gallery_images = []
+    valid_gallery = []
+    for gid in tqdm(gallery_ids, desc="Loading gallery"):
+        img = load_image_by_id(gid, url_mapping, cache_dir)
+        if img is not None:
+            gallery_images.append(img)
+            valid_gallery.append(gid)
+    print(f"Loaded {len(valid_gallery)}/{len(gallery_ids)} images")
+
+    gallery_emb = model.encode(images=gallery_images)
+    gid_to_idx = {gid: i for i, gid in enumerate(valid_gallery)}
+
+    fetch_k = top_k + skip_top
+    if skip_top > 0:
+        print(
+            f"Hard mining: skip_top={skip_top}, "
+            f"picking from ranks {skip_top+1}-{fetch_k}"
+        )
+
+    triplets = []
+    print(f"Mining hard negatives for {len(annotations)} annotations...")
+
+    for ann in tqdm(annotations, desc="Mining"):
+        candidate_id = ann["candidate"]
+        target_id = ann["target"]
+
+        if target_id not in gid_to_idx:
+            continue
+
+        c_img = load_image_by_id(candidate_id, url_mapping, cache_dir)
+        if c_img is None:
+            continue
+
+        target_set = {target_id, candidate_id}
+
+        for caption in ann["captions"]:
+            # Encode composed query
+            q_emb = model.encode(
+                images=[c_img], texts=[caption], show_progress=False,
+            )
+            scores = torch.mm(q_emb, gallery_emb.t()).squeeze(0)
+            topk_indices = torch.topk(
+                scores, min(fetch_k, len(valid_gallery))
+            ).indices.tolist()
+
+            # Filter non-targets, then skip top N
+            hard_neg_ids = [
+                valid_gallery[i] for i in topk_indices
+                if valid_gallery[i] not in target_set
+            ]
+            hard_neg_ids = hard_neg_ids[skip_top:]
+
+            if not hard_neg_ids:
+                fallback = [
+                    g for g in valid_gallery if g not in target_set
+                ]
+                hard_neg_ids = rng.sample(
+                    fallback, min(n_negatives, len(fallback))
+                )
+
+            for neg_id in hard_neg_ids[:n_negatives]:
+                triplets.append(ComposedTriplet(
+                    candidate_id=candidate_id,
+                    caption=caption,
+                    target_id=target_id,
+                    negative_id=neg_id,
+                ))
+
+    rng.shuffle(triplets)
+    print(f"Mined {len(triplets)} hard composed triplets")
+    return triplets
+
+
+def build_mixed_triplets(
+    model, annotations, gallery_ids, url_mapping,
+    cache_dir=None, n_random=2, n_hard=1,
+    top_k=50, skip_top=0, seed=42,
+):
+    """Build mixed (random + hard) composed triplets."""
+    hard = mine_hard_triplets(
+        model, annotations, gallery_ids, url_mapping,
+        cache_dir=cache_dir, n_negatives=n_hard,
+        top_k=top_k, skip_top=skip_top, seed=seed,
+    )
+    rand = build_random_triplets(
+        annotations, gallery_ids,
+        n_negatives=n_random, seed=seed,
+    )
+    combined = hard + rand
+    random.Random(seed).shuffle(combined)
+    print(
+        f"Mixed: {len(hard)} hard + {len(rand)} random "
+        f"= {len(combined)} total"
+    )
+    return combined
 
 
 # ──────────────────────────────────────────────────────────
@@ -334,11 +446,16 @@ def run_experiment(
     data_dir: str = "./data/fashioniq",
     cache_dir: str = "./data/fashioniq/image_cache",
     model_name: str = "Salesforce/blip2-itm-vit-g",
+    negatives: str = "mixed",
+    n_random: int = 2,
+    n_hard: int = 1,
+    n_negatives: int = 3,
+    top_k: int = 50,
+    skip_top: int = 0,
     epochs: int = 5,
     batch_size: int = 8,
     lr: float = 2e-5,
     lora_r: int = 8,
-    n_negatives: int = 1,
     max_eval_queries: int | None = 100,
     output_dir: str = "./output/fashioniq",
 ):
@@ -352,6 +469,13 @@ def run_experiment(
     print(f"\n{'#' * 60}")
     print(f"# FashionIQ Composed Retrieval: {category.upper()}")
     print(f"# Model: {model_name} + LoRA (r={lora_r})")
+    print(f"# Negatives: {negatives}")
+    if negatives == "mixed":
+        print(f"#   n_random={n_random}, n_hard={n_hard}")
+    elif negatives == "hard":
+        print(f"#   n_negatives={n_negatives}, skip_top={skip_top}")
+    else:
+        print(f"#   n_negatives={n_negatives}")
     print(f"{'#' * 60}")
 
     # Load data
@@ -362,12 +486,8 @@ def run_experiment(
     url_mapping = load_url_mapping(data_path, category)
     print(f"  {len(url_mapping)} URLs")
 
-    # Build model using khoji's MultimodalEmbeddingModel
-    # The .encode(images=..., texts=...) method jointly encodes via Q-Former
+    # Build model using khoji
     lora = khoji.LoRASettings(r=lora_r, alpha=lora_r * 2, dropout=0.1)
-
-    # We need to apply LoRA manually since MultimodalEmbeddingModel
-    # loads in eval mode. We'll load base, apply LoRA, then train.
     model = khoji.MultimodalEmbeddingModel(model_name)
     model._full_model = khoji.lora.apply_lora(model._full_model, lora)
 
@@ -378,10 +498,25 @@ def run_experiment(
         cache_dir=cache_path, max_queries=max_eval_queries,
     )
 
+    # Build triplets based on strategy
+    if negatives == "hard":
+        triplets = mine_hard_triplets(
+            model, train_anns, train_gallery, url_mapping,
+            cache_dir=cache_path, n_negatives=n_negatives,
+            top_k=top_k, skip_top=skip_top,
+        )
+    elif negatives == "mixed":
+        triplets = build_mixed_triplets(
+            model, train_anns, train_gallery, url_mapping,
+            cache_dir=cache_path, n_random=n_random, n_hard=n_hard,
+            top_k=top_k, skip_top=skip_top,
+        )
+    else:
+        triplets = build_random_triplets(
+            train_anns, train_gallery, n_negatives=n_negatives,
+        )
+
     # Train
-    triplets = build_triplets(
-        train_anns, train_gallery, n_negatives=n_negatives
-    )
     history = train(
         model, triplets, url_mapping,
         cache_dir=cache_path, epochs=epochs,
@@ -419,14 +554,26 @@ def main():
     )
     parser.add_argument("--data-dir", default="./data/fashioniq")
     parser.add_argument("--cache-dir", default="./data/fashioniq/image_cache")
+    parser.add_argument("--model", default="Salesforce/blip2-itm-vit-g")
     parser.add_argument(
-        "--model", default="Salesforce/blip2-itm-vit-g",
+        "--negatives", default="mixed",
+        choices=["random", "hard", "mixed"],
+        help="Negative strategy (default: mixed)",
     )
+    parser.add_argument("--n-random", type=int, default=2,
+                        help="Random negatives per pair (mixed mode)")
+    parser.add_argument("--n-hard", type=int, default=1,
+                        help="Hard negatives per pair (mixed mode)")
+    parser.add_argument("--n-negatives", type=int, default=3,
+                        help="Negatives per pair (random/hard mode)")
+    parser.add_argument("--top-k", type=int, default=50,
+                        help="Top-k for hard negative mining")
+    parser.add_argument("--skip-top", type=int, default=0,
+                        help="Skip top N non-target images (false negatives)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--lora-r", type=int, default=8)
-    parser.add_argument("--n-negatives", type=int, default=1)
     parser.add_argument("--max-eval-queries", type=int, default=100)
     parser.add_argument("--output-dir", default="./output/fashioniq")
     args = parser.parse_args()
@@ -436,9 +583,12 @@ def main():
         run_experiment(
             category=cat, data_dir=args.data_dir,
             cache_dir=args.cache_dir, model_name=args.model,
+            negatives=args.negatives,
+            n_random=args.n_random, n_hard=args.n_hard,
+            n_negatives=args.n_negatives,
+            top_k=args.top_k, skip_top=args.skip_top,
             epochs=args.epochs, batch_size=args.batch_size,
             lr=args.lr, lora_r=args.lora_r,
-            n_negatives=args.n_negatives,
             max_eval_queries=args.max_eval_queries,
             output_dir=args.output_dir,
         )
