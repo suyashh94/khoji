@@ -336,6 +336,8 @@ def main():
     parser.add_argument("--n-negatives", type=int, default=3)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--skip-top", type=int, default=0)
+    parser.add_argument("--mining-rounds", type=int, default=1,
+                        help="Iterative mining rounds (re-mine with fine-tuned model)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -376,29 +378,35 @@ def main():
         cache_dir=cache_path, max_queries=args.max_eval_queries,
     )
 
-    # Build triplets
-    if args.negatives == "hard":
-        triplets = mine_hard_triplets(
-            model, train_anns, train_gallery, url_mapping,
-            cache_dir=cache_path, n_negatives=args.n_negatives,
-            top_k=args.top_k, skip_top=args.skip_top,
-        )
-    elif args.negatives == "mixed":
-        triplets = build_mixed_triplets(
-            model, train_anns, train_gallery, url_mapping,
-            cache_dir=cache_path, n_random=args.n_random, n_hard=args.n_hard,
-            top_k=args.top_k, skip_top=args.skip_top,
-        )
-    else:
-        triplets = build_random_triplets(train_anns, train_gallery, n_negatives=args.n_negatives)
+    # Training with mining rounds
+    for round_idx in range(args.mining_rounds):
+        round_lr = args.lr / (2 ** round_idx)
+        if args.mining_rounds > 1:
+            print(f"\n--- Mining Round {round_idx + 1}/{args.mining_rounds} (lr={round_lr}) ---")
 
-    # Train
-    history = train_composed(
-        model, triplets, url_mapping,
-        cache_dir=cache_path, epochs=args.epochs,
-        batch_size=args.batch_size, lr=args.lr,
-    )
-    history.save(str(out_path / "train_history.json"))
+        # Build triplets
+        if args.negatives == "hard":
+            triplets = mine_hard_triplets(
+                model, train_anns, train_gallery, url_mapping,
+                cache_dir=cache_path, n_negatives=args.n_negatives,
+                top_k=args.top_k, skip_top=args.skip_top,
+            )
+        elif args.negatives == "mixed":
+            triplets = build_mixed_triplets(
+                model, train_anns, train_gallery, url_mapping,
+                cache_dir=cache_path, n_random=args.n_random, n_hard=args.n_hard,
+                top_k=args.top_k, skip_top=args.skip_top,
+            )
+        else:
+            triplets = build_random_triplets(train_anns, train_gallery, n_negatives=args.n_negatives)
+
+        # Train
+        history = train_composed(
+            model, triplets, url_mapping,
+            cache_dir=cache_path, epochs=args.epochs,
+            batch_size=args.batch_size, lr=round_lr,
+        )
+        history.save(str(out_path / f"train_history_r{round_idx + 1}.json"))
 
     # Evaluate
     print("\n--- Fine-tuned ---")

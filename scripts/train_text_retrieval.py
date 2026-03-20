@@ -1,4 +1,4 @@
-"""Text-to-text retrieval: Fine-tune MiniLM on SciFact.
+"""Text-to-text retrieval: Fine-tune MiniLM on FiQA.
 
 Demonstrates the full khoji Python API for text retrieval:
 - Load a BEIR dataset
@@ -23,13 +23,13 @@ from khoji.loss import infonce_loss
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 REFERENCE_MODEL = "BAAI/bge-base-en-v1.5"
-DATASET = "scifact"
-OUTPUT_DIR = "./output/text-retrieval"
+DATASET = "fiqa"
+OUTPUT_DIR = "./output/text-retrieval-fiqa"
 
 
 def main():
     print("=" * 60)
-    print("Text-to-Text Retrieval: MiniLM on SciFact")
+    print("Text-to-Text Retrieval: MiniLM on FiQA")
     print("=" * 60)
 
     # ── 1. Load data ──────────────────────────────────────
@@ -87,8 +87,8 @@ def main():
     history = trainer.train(khoji.TripletDataset(triplets))
     history.save(f"{OUTPUT_DIR}/train_history.json")
 
-    # ── 6. Evaluate fine-tuned model ──────────────────────
-    print("\n--- Fine-tuned: MiniLM + LoRA ---")
+    # ── 6. Evaluate single-round model ──────────────────────
+    print("\n--- Fine-tuned: MiniLM + LoRA (1 round) ---")
     ft_eval = khoji.Evaluator(MODEL, adapter_path=f"{OUTPUT_DIR}/adapter")
     ft_result = ft_eval.evaluate(
         dataset_name=DATASET, k_values=[1, 5, 10], dataset=test_ds,
@@ -97,7 +97,49 @@ def main():
     ft_result.save(f"{OUTPUT_DIR}/finetuned.json")
     del ft_eval
 
-    # ── 7. Comparison ─────────────────────────────────────
+    # ── 7. Iterative mining rounds ────────────────────────
+    # Round 2: re-mine negatives using the fine-tuned model,
+    # then train again with halved LR for sharper negatives
+    print("\n--- Round 2: re-mine with fine-tuned model ---")
+    ft_mining_model = khoji.EmbeddingModel(
+        MODEL, adapter_path=f"{OUTPUT_DIR}/adapter",
+    )
+    triplets_r2 = khoji.build_mixed_negatives(
+        train_ds, ft_mining_model,
+        n_random=2, n_hard=1, top_k=50, skip_top=0,
+    )
+    del ft_mining_model
+    print(f"Round 2 triplets: {len(triplets_r2)}")
+
+    config_r2 = khoji.TrainingConfig(
+        epochs=3,
+        batch_size=16,
+        lr=1e-5,  # halved LR for round 2
+        warmup_steps=30,
+        max_length=512,
+        loss_fn=partial(infonce_loss, temperature=0.05),
+        lora=lora,
+        save_dir=f"{OUTPUT_DIR}/adapter_r2",
+        sanity_check_samples=10,
+    )
+
+    # Warm-start from round 1's adapter
+    trainer_r2 = khoji.Trainer(
+        MODEL, config_r2, adapter_path=f"{OUTPUT_DIR}/adapter",
+    )
+    history_r2 = trainer_r2.train(khoji.TripletDataset(triplets_r2))
+
+    print("\n--- Fine-tuned: MiniLM + LoRA (2 rounds) ---")
+    ft2_eval = khoji.Evaluator(
+        MODEL, adapter_path=f"{OUTPUT_DIR}/adapter_r2",
+    )
+    ft2_result = ft2_eval.evaluate(
+        dataset_name=DATASET, k_values=[1, 5, 10], dataset=test_ds,
+    )
+    ft2_result.print()
+    del ft2_eval
+
+    # ── 8. Comparison ─────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("COMPARISON")
     print(f"{'=' * 60}")
@@ -106,13 +148,14 @@ def main():
     for name, r in [
         ("BGE-base (110M)", ref_result),
         ("MiniLM baseline", base_result),
-        ("MiniLM + LoRA", ft_result),
+        ("MiniLM + LoRA (1 round)", ft_result),
+        ("MiniLM + LoRA (2 rounds)", ft2_result),
     ]:
         m = r.metrics
         print(f"{name:<25} {m['ndcg@10']:>10.4f} {m['mrr@10']:>10.4f} {m['recall@10']:>10.4f}")
 
     gap_before = ref_result.metrics["ndcg@10"] - base_result.metrics["ndcg@10"]
-    gap_after = ref_result.metrics["ndcg@10"] - ft_result.metrics["ndcg@10"]
+    gap_after = ref_result.metrics["ndcg@10"] - ft2_result.metrics["ndcg@10"]
     if gap_before > 0:
         print(f"\nnDCG@10 gap vs BGE: {gap_before:.4f} → {gap_after:.4f}")
         print(f"Gap closed by {100 * (1 - gap_after / gap_before):.1f}%")
@@ -122,7 +165,7 @@ def main():
     print("INFERENCE DEMO")
     print(f"{'=' * 60}")
 
-    model = khoji.EmbeddingModel(MODEL, adapter_path=f"{OUTPUT_DIR}/adapter")
+    model = khoji.EmbeddingModel(MODEL, adapter_path=f"{OUTPUT_DIR}/adapter_r2")
 
     query = "Vitamin D deficiency increases respiratory infection risk."
     docs = [

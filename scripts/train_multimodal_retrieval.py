@@ -20,11 +20,7 @@ import torch
 
 import khoji
 from khoji.loss import infonce_loss
-from khoji.multimodal_data import (
-    build_mixed_negatives_multimodal,
-    build_random_negatives_multimodal,
-    mine_hard_negatives_multimodal,
-)
+from khoji.multimodal_data import build_mixed_negatives_multimodal
 from khoji.multimodal_dataset import load_rsicd
 
 MODEL = "openai/clip-vit-base-patch32"
@@ -52,12 +48,12 @@ def main():
     del base_eval
 
     # ── 3. Build training triplets ────────────────────────
-    # Mixed: 2 random + 1 hard negative per pair
+    # Mixed: 4 random + 1 hard negative per pair
     # skip_top=5: skip top 5 non-relevant (likely mislabeled in RSICD)
     mining_model = khoji.MultimodalEmbeddingModel(MODEL)
     triplets = build_mixed_negatives_multimodal(
         train_ds, mining_model,
-        n_random=2, n_hard=1, top_k=50, skip_top=5,
+        n_random=4, n_hard=1, top_k=50, skip_top=5,
     )
     del mining_model
     print(f"Total triplets: {len(triplets)}")
@@ -98,26 +94,72 @@ def main():
     ft_result.save(f"{OUTPUT_DIR}/finetuned.json")
     del ft_eval
 
-    # ── 7. Comparison ─────────────────────────────────────
+    # ── 7. 2-round mining via YAML pipeline ─────────────────
+    # Alternative: use the run() pipeline with mining_rounds
+    # This does everything automatically (mine → train → re-mine → train)
+    print("\n--- 2-round mining via run() pipeline ---")
+    from khoji.multimodal_config import MultimodalForgeConfig
+    from khoji.multimodal_run import run_multimodal
+
+    config_yaml = f"""
+model:
+  name: {MODEL}
+  lora_target: both
+data:
+  dataset: arampacha/rsicd
+  split: train
+  negatives: mixed
+  n_random: 4
+  n_hard: 1
+  top_k: 50
+  skip_top: 5
+  mining_rounds: 2
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+train:
+  epochs: 2
+  batch_size: 16
+  grad_accum_steps: 2
+  lr: 2e-5
+  warmup_steps: 50
+  max_length: 77
+  loss: infonce
+  temperature: 0.05
+  sanity_check_samples: 5
+seed: 42
+eval:
+  k_values: [1, 5, 10]
+  split: test
+  run_before: false
+  run_after: true
+output_dir: {OUTPUT_DIR}/2rounds
+"""
+    with open("/tmp/rsicd_2rounds.yaml", "w") as f:
+        f.write(config_yaml)
+
+    cfg = MultimodalForgeConfig.from_yaml("/tmp/rsicd_2rounds.yaml")
+    result_2rounds = run_multimodal(cfg)
+
+    # ── 8. Comparison ─────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("COMPARISON")
     print(f"{'=' * 60}")
-    print(f"{'Model':<25} {'nDCG@10':>10} {'MRR@10':>10} {'R@10':>10}")
-    print("-" * 57)
+    print(f"{'Model':<30} {'nDCG@10':>10} {'MRR@10':>10} {'R@10':>10}")
+    print("-" * 62)
     for name, r in [
         ("CLIP baseline", base_result),
-        ("CLIP + LoRA", ft_result),
+        ("CLIP + LoRA (1 round)", ft_result),
+        ("CLIP + LoRA (2 rounds)", result_2rounds.finetuned),
     ]:
         m = r.metrics
         print(
-            f"{name:<25} {m['ndcg@10']:>10.4f} "
+            f"{name:<30} {m['ndcg@10']:>10.4f} "
             f"{m['mrr@10']:>10.4f} {m['recall@10']:>10.4f}"
         )
 
-    delta = ft_result.metrics["ndcg@10"] - base_result.metrics["ndcg@10"]
-    print(f"\nnDCG@10 improvement: {delta:+.4f}")
-
-    # ── 8. Inference ──────────────────────────────────────
+    # ── 9. Inference ──────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("INFERENCE DEMO")
     print(f"{'=' * 60}")
