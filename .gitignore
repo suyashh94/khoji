@@ -25,3 +25,4 @@ forge-output/
 # Distribution
 *.whl
 *.tar.gz
+data/
