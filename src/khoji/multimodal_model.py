@@ -31,17 +31,32 @@ class MultimodalEmbeddingModel:
 
         model = MultimodalEmbeddingModel("openai/clip-vit-base-patch32")
 
+    **HuggingFace BLIP-2 models (supports joint image+text encoding):**
+
+        model = MultimodalEmbeddingModel("Salesforce/blip2-itm-vit-g")
+        emb = model.encode(images=[img], texts=["make it red"])
+
     **Custom models:**
 
         model = MultimodalEmbeddingModel(
             text_model=my_text_encoder,
             vision_model=my_vision_encoder,
             tokenizer=my_tokenizer,
-            image_processor=my_processor,  # callable: list[PIL.Image] -> tensor
+            image_processor=my_processor,
+        )
+
+    **Custom models with joint encoding:**
+
+        model = MultimodalEmbeddingModel(
+            text_model=my_text_encoder,
+            vision_model=my_vision_encoder,
+            tokenizer=my_tokenizer,
+            image_processor=my_processor,
+            joint_encoder=my_joint_fn,  # (images, texts, device) -> tensor
         )
 
     Args:
-        model_name: HuggingFace model ID (CLIP or SigLIP).
+        model_name: HuggingFace model ID (CLIP, SigLIP, or BLIP-2).
         adapter_path: Path to saved LoRA adapter weights.
         device: Device to use. None = auto-detect.
         text_model: Custom text encoder (nn.Module).
@@ -49,6 +64,10 @@ class MultimodalEmbeddingModel:
         tokenizer: Tokenizer for text inputs.
         image_processor: Callable that takes list[PIL.Image] and returns
             a batched pixel tensor.
+        joint_encoder: Callable for joint (image+text) encoding. Signature:
+            ``(images: list[PIL.Image], texts: list[str], device) -> Tensor``.
+            When provided, ``encode(images=..., texts=...)`` uses this instead
+            of additive fusion. The returned tensor should be L2-normalized.
         preprocess_overrides: Dict with optional keys: image_size, mean, std.
         max_length: Maximum token length for text inputs.
         dtype: Load base model in "fp16", "bf16", or None (fp32).
@@ -63,6 +82,7 @@ class MultimodalEmbeddingModel:
         vision_model: torch.nn.Module | None = None,
         tokenizer: object | None = None,
         image_processor: Callable[[list[Image.Image]], torch.Tensor] | None = None,
+        joint_encoder: Callable | None = None,
         preprocess_overrides: dict | None = None,
         max_length: int = 77,
         dtype: str | None = None,
@@ -70,6 +90,7 @@ class MultimodalEmbeddingModel:
         self.device = device or get_device()
         self.max_length = max_length
         self._torch_dtype = _resolve_dtype(dtype)
+        self._joint_encoder = joint_encoder
 
         if text_model is not None and vision_model is not None:
             # Custom model path
@@ -84,7 +105,11 @@ class MultimodalEmbeddingModel:
             self.model_type = "custom"
             self._full_model = None
             dtype_str = f" | dtype: {dtype}" if dtype else ""
-            print(f"Loaded custom multimodal model | device: {self.device}{dtype_str}")
+            joint_str = " | joint_encoder: yes" if joint_encoder else ""
+            print(
+                f"Loaded custom multimodal model | "
+                f"device: {self.device}{dtype_str}{joint_str}"
+            )
 
         elif model_name is not None:
             # HuggingFace model path
@@ -231,21 +256,28 @@ class MultimodalEmbeddingModel:
         if images is None and texts is None:
             raise ValueError("Provide at least one of images or texts.")
 
-        if self.model_type == "blip-2":
-            return self._encode_blip2(
-                images, texts, batch_size, show_progress
-            )
-
-        # CLIP/SigLIP fallback
+        # Joint encoding: image + text together
         if images is not None and texts is not None:
+            if self.model_type == "blip-2":
+                return self._encode_blip2(
+                    images, texts, batch_size, show_progress
+                )
+            if self._joint_encoder is not None:
+                return self._joint_encoder(images, texts, self.device)
+            # Additive fusion fallback for CLIP/SigLIP/custom
             img_emb = self.encode_images(images, batch_size, show_progress)
             txt_emb = self.encode_text(texts, batch_size, show_progress)
             fused = img_emb + txt_emb
             return torch.nn.functional.normalize(fused, p=2, dim=1)
-        elif images is not None:
+
+        # Single modality
+        if self.model_type == "blip-2":
+            return self._encode_blip2(
+                images, texts, batch_size, show_progress
+            )
+        if images is not None:
             return self.encode_images(images, batch_size, show_progress)
-        else:
-            return self.encode_text(texts, batch_size, show_progress)
+        return self.encode_text(texts, batch_size, show_progress)
 
     @torch.no_grad()
     def _encode_blip2(
