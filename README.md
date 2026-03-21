@@ -1,27 +1,48 @@
 # khoji
 
-**Fine-tune embedding models for domain-specific retrieval using LoRA**
+**Make retrieval models actually work on your data**
 
-[Installation](#installation) | [Quick Start](#quick-start) | [Text-to-Text](#configuration-reference) | [Text-to-Image](#text-to-image-retrieval) | [Python API](#python-api) | [Architecture](#architecture)
+[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture)
 
 ---
 
-**khoji** is a lightweight, modular Python library for fine-tuning retrieval models on domain-specific data using [LoRA](https://arxiv.org/abs/2106.09685). It supports both **text-to-text** and **text-to-image** retrieval, multiple loss functions, and end-to-end evaluation with standard IR metrics — all written from scratch with no dependency on high-level evaluation frameworks.
+Pretrained retrieval models (BERT, CLIP, BLIP-2) are trained on generic web data. They work reasonably well out of the box, but struggle on domain-specific queries — legal documents, medical images, satellite imagery, fashion products, internal knowledge bases. The standard fix is fine-tuning, but wiring together the data pipeline, negative mining, LoRA, training loop, and evaluation for retrieval is a lot of boilerplate.
 
-**Key features:**
+khoji handles all of that. You point it at your data and a base model, and it fine-tunes a retrieval adapter using LoRA — with hard negative mining, standard IR evaluation, and support for text search, image search, and composed image retrieval (e.g., "find this dress but in red"). It works as a single YAML config for quick experiments, or as composable Python components when you need full control.
 
-- **Two retrieval modes:** text-to-text (BERT, sentence-transformers) and text-to-image (CLIP, SigLIP)
-- Parameter-efficient fine-tuning via LoRA (only adapter weights are trained and saved)
-- Full fine-tuning support (`lora: null`)
-- Multiple loss functions: Triplet Margin, InfoNCE, Contrastive
-- Negative mining strategies: random, hard, or mixed (random + hard combined)
-- Custom retrieval metrics: nDCG@k, MRR@k, Recall@k — implemented from scratch
+### Three retrieval modes
+
+| Mode | Query | Target | Models | Use case |
+|------|-------|--------|--------|----------|
+| **Text → Text** | text | text | BERT, BGE, sentence-transformers | Document search, FAQ matching, semantic search |
+| **Text → Image** | text | image | CLIP, SigLIP | Image search from text descriptions |
+| **(Image + Text) → Image** | reference image + modification caption | image | BLIP-2 | "Find me this dress but in red" |
+
+### Two levels of abstraction
+
+| Level | What you write | Best for |
+|-------|---------------|----------|
+| **Config-driven** | A YAML file → `run()` / `run_multimodal()` / `run_composed()` | Reproducible experiments, quick iteration |
+| **Python API** | Compose individual components (model, trainer, evaluator, data) | Custom workflows, non-standard data sources, research |
+
+### What you can plug in
+
+| Component | Built-in | Custom |
+|-----------|----------|--------|
+| **Models** | Any HuggingFace model (auto-detected) | Any `nn.Module` + encode function |
+| **Datasets** | BEIR (20+), Flickr30k, RSICD, FashionIQ | JSONL/TSV files, or raw Python dicts |
+| **Loss functions** | Triplet Margin, InfoNCE, Contrastive | Any `(query, pos, neg) -> scalar` callable |
+| **Metrics** | nDCG@k, MRR@k, Recall@k | Any `(ranked_ids, qrel, k) -> float` callable |
+| **Negative mining** | Random, hard, mixed | Build your own `Triplet` / `ComposedTriplet` objects |
+
+### Other highlights
+
+- Parameter-efficient fine-tuning via **LoRA** (or full fine-tuning with `lora: null`)
 - Auto-detection of model pooling strategy and LoRA target modules
-- YAML-driven configuration for reproducible experiments
-- Full Python API — inspect training history, plot loss curves, programmatic access to everything
-- Image loading from local files or URLs with optional caching
-- Custom models, loss functions, metrics, and image preprocessing — all pluggable
-- Hardware support: CUDA, Apple Silicon (MPS), and CPU
+- Iterative hard negative mining (re-mine with the fine-tuned model)
+- Mixed precision training (fp16/bf16)
+- All metrics implemented from scratch — no external IR evaluation frameworks
+- Hardware support: CUDA, Apple Silicon (MPS), CPU
 
 ---
 
@@ -29,1097 +50,257 @@
 
 **Requirements:** Python >= 3.10
 
-### From PyPI
-
 ```bash
+# From PyPI
 pip install khoji
-```
 
-### From source (recommended during development)
-
-```bash
-# Clone the repository
+# From source
 git clone https://github.com/suyashh94/khoji.git
 cd khoji
-
-# Install with uv (recommended)
-uv sync
-
-# Or with pip
-pip install -e .
-```
-
-### Dev dependencies
-
-```bash
-uv sync --group dev   # installs pytest, ruff
+uv sync              # or: pip install -e .
+uv sync --group dev  # adds pytest, ruff
 ```
 
 ---
 
 ## Quick Start
 
-### CLI
+### Text → Text
 
 ```bash
-# Generate example config files (text-text and text-image)
-khoji init
-
-# Text-to-text retrieval (e.g., BERT, BGE)
-khoji fiqa_quick.yaml
-
-# Text-to-image retrieval (e.g., CLIP, SigLIP)
-khoji multimodal flickr30k_quick.yaml
+khoji init                   # generate example configs
+khoji fiqa_quick.yaml        # train + evaluate
 ```
 
-### Python API
-
 ```python
-# Text-to-text
 from khoji import ForgeConfig, run
 
 config = ForgeConfig.from_yaml("fiqa_quick.yaml")
 result = run(config)
+print(result.finetuned.metrics)   # {"ndcg@1": 0.45, "mrr@5": 0.52, ...}
+print(result.adapter_dir)         # path to saved LoRA adapter
+```
 
-# Text-to-image
+### Text → Image
+
+```bash
+khoji multimodal flickr30k_quick.yaml
+```
+
+```python
 from khoji import MultimodalForgeConfig, run_multimodal
 
 config = MultimodalForgeConfig.from_yaml("flickr30k_quick.yaml")
 result = run_multimodal(config)
 ```
 
-### Text-to-text example
+### (Image + Text) → Image (Composed Retrieval)
 
 ```python
-from khoji import ForgeConfig, run
+from khoji import ComposedForgeConfig, run_composed
 
-config = ForgeConfig.from_yaml("configs/fiqa_quick.yaml")
-result = run(config)
-
-# Inspect training history
-print(result.history.epoch_loss)        # [0.182, 0.091, ...]
-print(result.history.step_loss[:5])     # per optimizer step
-print(result.history.step_lr[:5])       # learning rate schedule
-print(result.history.step_grad_norm[:5])# gradient norms
-
-# Plot loss curve
-import matplotlib.pyplot as plt
-plt.plot(result.history.step_loss)
-plt.xlabel("Optimizer Step")
-plt.ylabel("Loss")
-plt.title("Training Loss")
-plt.savefig("loss_curve.png")
-
-# Compare baseline vs fine-tuned
-if result.baseline and result.finetuned:
-    for metric in result.baseline.metrics:
-        b = result.baseline.metrics[metric]
-        f = result.finetuned.metrics[metric]
-        print(f"{metric}: {b:.4f} -> {f:.4f} ({f-b:+.4f})")
-
-# Use the trained model for inference
-from khoji import EmbeddingModel
-model = EmbeddingModel("BAAI/bge-base-en-v1.5", adapter_path=result.adapter_dir, dtype="bf16")
-embeddings = model.encode(["What is compound interest?", "How do bonds work?"])
+config = ComposedForgeConfig.from_yaml("composed_config.yaml")
+result = run_composed(config)
 ```
 
 ---
 
-## Configuration Reference
+## Retrieval Modes
 
-All configuration is driven by a single YAML file. Below is every parameter with its type, default, and description.
+### 1. Text → Text
 
-### Full annotated config
+Fine-tune text embedding models (BERT, BGE, sentence-transformers) for domain-specific document retrieval.
+
+#### Config-driven
 
 ```yaml
-# ── Model ─────────────────────────────────────────────────────────
 model:
-  name: BAAI/bge-base-en-v1.5        # HuggingFace model identifier
-  # adapter_path: null               # Path to existing LoRA adapter (for continued training)
-  # dtype: null                      # Load base model in "fp16", "bf16", or null (fp32)
-                                      #   Reduces memory. LoRA weights always stay in fp32.
+  name: BAAI/bge-base-en-v1.5
+  # adapter_path: null          # warm-start from existing adapter
+  # dtype: null                 # "fp16", "bf16", or null (fp32)
 
-# ── Data ──────────────────────────────────────────────────────────
 data:
-  dataset: fiqa                       # BEIR dataset name (e.g., fiqa, scifact, nfcorpus, etc.)
-  split: train                        # Dataset split: "train", "validation", or "test"
-  negatives: random                   # Negative strategy: "random", "hard", or "mixed"
-  n_negatives: 1                      # Negatives per pair (used by "random" and "hard" modes)
-  # n_random: 1                      # Random negatives per pair (only for "mixed" mode)
-  # n_hard: 1                        # Hard negatives per pair (only for "mixed" mode)
-  n_queries: null                     # Number of queries to use (null = all)
-  corpus_size: null                   # Corpus size limit (null = full). Only relevant for hard negatives.
-  # top_k: 50                        # Top-k corpus docs to consider for hard negative mining
-  # skip_top: 0                      # Skip top N non-relevant docs (avoids false negatives)
-  # mining_rounds: 1                 # Iterative mining rounds (hard/mixed only)
-                                      #   Round 2+ re-mines using the fine-tuned model
+  dataset: fiqa                  # BEIR dataset name or path to local directory
+  split: train
+  negatives: mixed               # "random", "hard", or "mixed"
+  n_random: 2                    # random negatives per pair (mixed mode)
+  n_hard: 1                      # hard negatives per pair (mixed mode)
+  # n_negatives: 1              # negatives per pair (random/hard modes)
+  # n_queries: null             # subset of queries (null = all)
+  # corpus_size: null           # corpus limit for mining (null = all)
+  # top_k: 50                   # top-k for hard negative mining
+  # skip_top: 0                 # skip top N non-relevant (avoids false negatives)
+  # mining_rounds: 1            # iterative mining rounds (re-mine with fine-tuned model)
 
-# ── LoRA ──────────────────────────────────────────────────────────
-# Set to null for full fine-tuning (all parameters trained):
-#   lora: null
 lora:
-  r: 8                                # LoRA rank (higher = more parameters, more capacity)
-  alpha: 16                           # LoRA scaling factor (typically 2x rank)
-  dropout: 0.1                        # Dropout on LoRA layers (0.0 for overfitting experiments)
-  # target_modules: null              # Layers to apply LoRA to (null = auto-detect by architecture)
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  # target_modules: null        # auto-detected per architecture
+# lora: null                    # uncomment for full fine-tuning
 
-# ── Training ──────────────────────────────────────────────────────
 train:
-  epochs: 3                           # Number of training epochs
-  batch_size: 8                       # Micro-batch size (per forward pass)
-  grad_accum_steps: 4                 # Gradient accumulation steps
-                                      #   effective batch size = batch_size * grad_accum_steps
-  lr: 2e-5                            # Learning rate (AdamW optimizer)
-  weight_decay: 0.01                  # AdamW weight decay
-  warmup_steps: 100                   # Linear warmup steps, then linear decay
-  max_grad_norm: 1.0                  # Gradient clipping (max L2 norm)
-  max_length: 512                     # Max token length for tokenization
-  loss: triplet                       # Loss function: "triplet", "infonce", or "contrastive"
-  margin: 0.2                         # Margin for triplet loss (ignored by other losses)
-  temperature: 0.05                   # Temperature for infonce loss (ignored by other losses)
-  # mixed_precision: null             # "fp16", "bf16", or null (disabled)
-  sanity_check_samples: 10            # Sample N training triplets and report cosine similarity
-                                      #   before/after training as a quick sanity check
-  # overfit_batches: null             # Set to 1 (or N) to overfit on N batches for debugging
-  # save_every_n_steps: null          # Save checkpoint every N optimizer steps
-  # keep_all_checkpoints: false       # true = keep all, false = keep only latest
-
-# seed: null                          # Global seed for reproducibility
-
-# ── Evaluation ────────────────────────────────────────────────────
-eval:
-  # dataset: null                     # Eval dataset — BEIR name or local path
-                                      #   null = use data.dataset. Set to evaluate on a
-                                      #   different dataset than you train on.
-  k_values: [1, 5, 10]               # K values for nDCG@k, MRR@k, Recall@k
-  split: test                         # Evaluation dataset split
-  n_queries: null                     # Number of eval queries (null = all)
-  corpus_size: null                   # Eval corpus size (null = full)
-  run_before: true                    # Evaluate baseline model before training
-  run_after: true                     # Evaluate fine-tuned model after training
-
-# ── Output ────────────────────────────────────────────────────────
-output_dir: ./forge-output            # Directory for adapter weights, configs, eval results
-```
-
-### Parameter details
-
-#### `model`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `name` | `str` | `BAAI/bge-base-en-v1.5` | Any HuggingFace transformer model. Sentence-transformer models are fully supported with auto-detected pooling. |
-| `adapter_path` | `str \| null` | `null` | Path to a previously saved LoRA adapter to continue training from. |
-| `dtype` | `str \| null` | `null` | Load base model weights in reduced precision: `"fp16"`, `"bf16"`, or `null` (fp32). Reduces memory — LoRA weights are always kept in fp32. See [Model Precision](#model-precision). |
-
-**Tested models:** `BAAI/bge-base-en-v1.5`, `sentence-transformers/all-MiniLM-L6-v2`. Any model on HuggingFace that works with `AutoModel` should work.
-
-#### `data`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dataset` | `str` | `fiqa` | BEIR dataset name **or** path to a local dataset directory. See [Custom Datasets](#custom-datasets). |
-| `split` | `str` | `train` | Which split to build training triplets from. |
-| `negatives` | `str` | `random` | `"random"`: fast, no model needed. `"hard"`: mines negatives using model embeddings (slower, better signal). `"mixed"`: both random and hard negatives combined — balanced training signal. |
-| `n_negatives` | `int` | `1` | Negatives per (query, positive) pair. Used by `random` and `hard` modes. Ignored by `mixed`. |
-| `n_random` | `int` | `1` | Random negatives per pair. Only used when `negatives: mixed`. |
-| `n_hard` | `int` | `1` | Hard negatives per pair. Only used when `negatives: mixed`. |
-| `n_queries` | `int \| null` | `null` | Subset of queries to use. `null` = all queries in the split. Useful for quick experiments. |
-| `corpus_size` | `int \| null` | `null` | Corpus size limit for hard negative mining. Relevant docs are always included. `null` = full corpus. |
-| `top_k` | `int` | `50` | Top similar docs to consider when mining hard negatives (for `hard` and `mixed` modes). |
-| `skip_top` | `int` | `0` | Skip the top N most similar non-relevant docs before picking hard negatives. The very top-ranked "negatives" are often unlabeled positives (false negatives in qrels). Set to 5-10 for datasets with incomplete relevance judgments. |
-| `mining_rounds` | `int` | `1` | Iterative mining rounds (for `hard` and `mixed` modes). Round 2+ re-mines negatives using the fine-tuned model from the previous round. LR is halved each round. |
-
-#### `lora`
-
-Set the entire `lora` section to `null` to disable LoRA and train **all model parameters** (full fine-tuning):
-
-```yaml
-lora: null    # full fine-tuning — all parameters are trained and saved
-```
-
-When `lora` is set (default), only the LoRA adapter weights are trained and saved:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `r` | `int` | `8` | LoRA rank. Controls the bottleneck dimension. Higher rank = more trainable parameters, more model capacity. Typical values: 4, 8, 16, 32. |
-| `alpha` | `int` | `16` | LoRA scaling factor. The effective scaling is `alpha / r`. Convention is `alpha = 2 * r`. |
-| `dropout` | `float` | `0.1` | Dropout applied to LoRA layers. Set to `0.0` when overfitting for debugging. |
-| `target_modules` | `list[str] \| null` | `null` | Which attention layers to apply LoRA to. `null` = auto-detect based on model architecture. |
-
-**Auto-detected target modules by architecture:**
-
-| Architecture | Target Modules |
-|-------------|---------------|
-| BERT | `query`, `key`, `value` |
-| RoBERTa | `query`, `key`, `value` |
-| DistilBERT | `q_lin`, `k_lin`, `v_lin` |
-| XLM-RoBERTa | `query`, `key`, `value` |
-| DeBERTa (v1/v2) | `query_proj`, `key_proj`, `value_proj` |
-| Mistral | `q_proj`, `k_proj`, `v_proj` |
-| LLaMA | `q_proj`, `k_proj`, `v_proj` |
-
-If your model architecture is not listed, set `target_modules` explicitly in the config.
-
-#### `train`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `epochs` | `int` | `3` | Number of passes over the training data. |
-| `batch_size` | `int` | `8` | Micro-batch size. Reduce this if you hit OOM errors (especially on MPS). |
-| `grad_accum_steps` | `int` | `4` | Accumulate gradients over N micro-batches before updating. Effective batch size = `batch_size * grad_accum_steps`. |
-| `lr` | `float` | `2e-5` | Learning rate for AdamW. Typical range: `1e-5` to `1e-3`. Use higher values (`1e-3`) for overfit debugging. |
-| `weight_decay` | `float` | `0.01` | AdamW weight decay. Set to `0.0` to disable. |
-| `warmup_steps` | `int` | `100` | Number of linear warmup steps. LR ramps from 0 to `lr`, then linearly decays to 0. |
-| `max_grad_norm` | `float` | `1.0` | Gradient clipping threshold (max L2 norm). Prevents exploding gradients. |
-| `max_length` | `int` | `512` | Maximum token length. Texts are truncated beyond this. Used consistently for both training and evaluation. |
-| `loss` | `str` | `triplet` | Loss function — see [Loss Functions](#loss-functions) below. |
-| `margin` | `float` | `0.2` | Margin for triplet loss. Only used when `loss: triplet`. |
-| `temperature` | `float` | `0.05` | Temperature for InfoNCE loss. Lower = sharper distribution. Only used when `loss: infonce`. |
-| `mixed_precision` | `str \| null` | `null` | Automatic mixed precision: `"fp16"`, `"bf16"`, or `null` (disabled). Reduces memory and speeds up training on CUDA. See [Mixed Precision](#mixed-precision). |
-| `sanity_check_samples` | `int` | `10` | Before and after training, sample N triplets and report cosine similarities and margins. Set to `0` to disable. |
-| `overfit_batches` | `int \| null` | `null` | Debug mode: train on only N batches for many epochs. Useful to verify the training pipeline works end to end. |
-| `save_every_n_steps` | `int \| null` | `null` | Save a checkpoint every N optimizer steps during training. `null` = disabled. |
-| `keep_all_checkpoints` | `bool` | `false` | `true` = keep all checkpoints (`checkpoint-100`, `checkpoint-200`, ...). `false` = keep only `checkpoint-latest` (overwritten each time). |
-
-#### `eval`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dataset` | `str \| null` | `null` | Evaluation dataset — BEIR name or local path. `null` = use `data.dataset`. Set this to evaluate on a **different** dataset than you train on. |
-| `k_values` | `list[int]` | `[1, 5, 10]` | K values for computing nDCG@k, MRR@k, and Recall@k. |
-| `split` | `str` | `test` | Dataset split to evaluate on (only used for BEIR datasets). |
-| `n_queries` | `int \| null` | `null` | Number of queries for evaluation. `null` = all. |
-| `corpus_size` | `int \| null` | `null` | Corpus size for evaluation. Relevant docs are always included + random filler. `null` = full. |
-| `run_before` | `bool` | `true` | Evaluate baseline model before fine-tuning. |
-| `run_after` | `bool` | `true` | Evaluate fine-tuned model after training. |
-
-#### `seed`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `seed` | `int \| null` | `null` | Global random seed for reproducibility. Sets `torch`, `random`, and `numpy` seeds. `null` = non-deterministic. |
-
-#### `output_dir`
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `output_dir` | `str` | `./forge-output` | Where to save adapter weights, config snapshot, training history, and evaluation results. |
-
-**Output directory structure:**
-```
-forge-output/
-  config.yaml            # Saved config for reproducibility
-  train_history.json     # Training curves (step_loss, step_lr, step_grad_norm, epoch_loss)
-  adapter/               # Final LoRA adapter weights (from last mining round)
-    adapter_model.safetensors
-    adapter_config.json
-    checkpoint-latest/   # Intermediate checkpoint (if save_every_n_steps is set)
-    checkpoint-100/      # Named checkpoints (if keep_all_checkpoints: true)
-    checkpoint-200/
-  adapter_r1/            # Round 1 adapter (only when mining_rounds > 1)
-  adapter_r2/            # Round 2 adapter (only when mining_rounds > 2)
-  baseline.json          # Baseline eval metrics (if run_before: true)
-  finetuned.json         # Fine-tuned eval metrics (if run_after: true)
-```
-
----
-
-## Loss Functions
-
-### Triplet Margin Loss (`loss: triplet`)
-
-```
-L = mean(relu(d(query, positive) - d(query, negative) + margin))
-```
-
-Where `d` is cosine distance (`1 - cosine_similarity`). Pushes positive pairs closer and negative pairs further apart by at least `margin`.
-
-- **When to use:** Good default. Works well with random negatives and small batch sizes.
-- **Key parameter:** `margin` (default: `0.2`)
-
-### InfoNCE Loss (`loss: infonce`)
-
-```
-L = -log(exp(sim(q, p+) / t) / sum(exp(sim(q, pi) / t)))
-```
-
-Cross-entropy over in-batch positives with all other positives and explicit hard negatives as distractors. Leverages in-batch negatives for richer training signal.
-
-- **When to use:** Best with larger batch sizes and hard negatives. Typically strongest performance.
-- **Key parameter:** `temperature` (default: `0.05`). Lower = sharper, more discriminative.
-
-### Contrastive Loss (`loss: contrastive`)
-
-```
-L = mean(-cos_sim(query, positive) + cos_sim(query, negative))
-```
-
-Direct optimization of cosine similarity without margin or temperature.
-
-- **When to use:** Simple baseline. No hyperparameters to tune beyond learning rate.
-
----
-
-## Custom Datasets
-
-Training and evaluation datasets are **fully independent**. You can mix and match BEIR datasets, local datasets, and programmatic datasets in any combination.
-
-### Dataset format
-
-Create a directory with three files:
-
-```
-my_dataset/
-  queries.jsonl      # One JSON object per line
-  corpus.jsonl       # One JSON object per line
-  qrels.tsv          # Tab-separated, no header
-```
-
-**queries.jsonl** — one query per line:
-```json
-{"_id": "q1", "text": "What is compound interest?"}
-{"_id": "q2", "text": "How do index funds work?"}
-```
-
-**corpus.jsonl** — one document per line (`title` is optional, gets prepended to `text`):
-```json
-{"_id": "d1", "text": "Compound interest is interest on interest.", "title": "Compound Interest"}
-{"_id": "d2", "text": "An index fund tracks a market index like the S&P 500."}
-```
-
-**qrels.tsv** — relevance judgments (tab-separated: `query_id`, `doc_id`, `score`). No header row:
-```
-q1	d1	1
-q2	d2	1
-```
-
-### Using separate train and eval datasets (YAML)
-
-The `data.dataset` and `eval.dataset` fields are independent. You can train on one dataset and evaluate on another:
-
-```yaml
-# Train on your domain data, evaluate on a BEIR benchmark
-data:
-  dataset: ./my_domain_data       # local custom dataset for training
-  negatives: random
-  n_negatives: 1
+  epochs: 3
+  batch_size: 8
+  grad_accum_steps: 4            # effective batch = batch_size * grad_accum_steps
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 100              # linear warmup then linear decay
+  max_grad_norm: 1.0
+  max_length: 512
+  loss: infonce                  # "triplet", "infonce", or "contrastive"
+  margin: 0.2                    # for triplet loss
+  temperature: 0.05              # for infonce loss
+  # mixed_precision: null        # "fp16", "bf16", or null
+  # overfit_batches: null        # set to 1 for debugging
+  sanity_check_samples: 10
 
 eval:
-  dataset: fiqa                    # BEIR dataset for evaluation (different from training!)
+  # dataset: null               # null = use data.dataset
+  k_values: [1, 5, 10]
   split: test
   run_before: true
   run_after: true
+
+seed: 42
+output_dir: ./forge-output
+```
+
+#### Python API (component-by-component)
+
+```python
+from khoji import (
+    EmbeddingModel, Evaluator, Trainer, TrainingConfig,
+    TripletDataset, LoRASettings,
+    load_beir, build_mixed_negatives,
+)
+
+# 1. Load data
+dataset = load_beir("fiqa", split="train")
+
+# 2. Build training triplets
+model = EmbeddingModel("BAAI/bge-base-en-v1.5")
+triplets = build_mixed_negatives(dataset, model, n_random=2, n_hard=1, top_k=50)
+
+# 3. Train
+config = TrainingConfig(
+    epochs=3, batch_size=8, lr=2e-5,
+    lora=LoRASettings(r=8, alpha=16),
+    save_dir="./my-adapter",
+)
+trainer = Trainer("BAAI/bge-base-en-v1.5", config)
+history = trainer.train(TripletDataset(triplets))
+
+# 4. Evaluate
+evaluator = Evaluator("BAAI/bge-base-en-v1.5", adapter_path="./my-adapter")
+result = evaluator.evaluate("fiqa", split="test", k_values=[1, 5, 10])
+result.print()
+
+# 5. Inference
+model = EmbeddingModel("BAAI/bge-base-en-v1.5", adapter_path="./my-adapter")
+embeddings = model.encode(["What is compound interest?", "How do bonds work?"])
+```
+
+#### Custom datasets
+
+Every dataset in khoji is just three things: **queries**, a **corpus**, and **relevance judgments** (qrels) mapping which corpus items are relevant to which queries. You can provide these as local files or as Python dicts.
+
+**Option A: Local files** — create a directory with three files:
+
+```
+my_dataset/
+  queries.jsonl   # {"_id": "q1", "text": "What is compound interest?"}
+  corpus.jsonl    # {"_id": "d1", "text": "Compound interest is ...", "title": "Optional Title"}
+  qrels.tsv       # q1\td1\t1  (tab-separated: query_id, doc_id, relevance_score. No header.)
 ```
 
 ```yaml
-# Train on BEIR, evaluate on your own held-out test set
 data:
-  dataset: fiqa
-  split: train
-
-eval:
-  dataset: ./my_test_set           # local custom dataset for evaluation
-  run_before: true
-  run_after: true
+  dataset: ./my_dataset    # point to the directory
 ```
 
-```yaml
-# Train and evaluate on different local datasets
-data:
-  dataset: ./my_train_data
-
-eval:
-  dataset: ./my_eval_data
-```
-
-If `eval.dataset` is omitted, it defaults to `data.dataset` (same dataset for both).
-
-### Programmatic: bring your own data in any format
-
-The library doesn't force you to use JSONL files or BEIR downloads. Every component accepts a `RetrievalDataset`, which is just three dicts. If your data lives in a database, CSV, Parquet, API, or anywhere else, just build the dicts yourself:
+**Option B: Python dicts** — build from any source (database, CSV, API, etc.):
 
 ```python
 from khoji import RetrievalDataset
 
-# RetrievalDataset is just three dicts — build it however you want
 dataset = RetrievalDataset(
-    queries={"q1": "What is compound interest?", "q2": "How do index funds work?"},
-    corpus={"d1": "Compound interest is ...", "d2": "An index fund ...", "d3": "Unrelated doc"},
-    qrels={"q1": {"d1": 1}, "q2": {"d2": 1}},
+    queries={"q1": "What is compound interest?"},
+    corpus={"d1": "Compound interest is interest on interest.", "d2": "Unrelated doc."},
+    qrels={"q1": {"d1": 1}},   # query q1 → doc d1 is relevant (score 1)
 )
+# Pass this to build_random_negatives(), Evaluator.evaluate(dataset=...), etc.
 ```
 
-See [Writing a custom training script](#writing-a-custom-training-script) for a complete example of using this with the full pipeline.
+Training and evaluation datasets are independent — you can train on one and evaluate on another:
 
----
-
-## Python API
-
-The library is designed for programmatic use. All key classes and functions are importable from the top-level package. Every component works independently — you can use the full `run()` pipeline, or pick individual pieces and compose your own workflow.
-
-### Full pipeline
-
-```python
-from khoji import ForgeConfig, run
-
-config = ForgeConfig.from_yaml("configs/fiqa_quick.yaml")
-result = run(config)
-
-# result.history     -> TrainHistory (step_loss, step_lr, step_grad_norm, epoch_loss)
-# result.baseline    -> EvalResult or None
-# result.finetuned   -> EvalResult or None
-# result.adapter_dir -> str (path to saved adapter)
-# result.config      -> ForgeConfig
+```yaml
+data:
+  dataset: ./my_train_data
+eval:
+  dataset: ./my_eval_data     # null = same as data.dataset
 ```
 
-### Component-by-component pipeline
+#### Supported models
 
-Each component can be used independently. Here's the standard flow broken down:
-
-```python
-from khoji import (
-    EmbeddingModel,
-    Evaluator,
-    LoRASettings,
-    Trainer,
-    TrainingConfig,
-    TripletDataset,
-    build_mixed_negatives,
-    build_random_negatives,
-    load_beir,
-    mine_hard_negatives,
-)
-
-# 1. Load dataset
-dataset = load_beir("fiqa", split="train")
-print(f"Queries: {len(dataset.queries)}, Corpus: {len(dataset.corpus)}")
-
-# 2. Build training triplets — three strategies:
-
-# Option A: Random negatives (fast, no model needed)
-triplets = build_random_negatives(dataset, n_negatives=3, n_queries=100)
-
-# Option B: Hard negatives (requires encoding the corpus)
-# model = EmbeddingModel("BAAI/bge-base-en-v1.5")
-# triplets = mine_hard_negatives(dataset, model, n_negatives=3, top_k=50)
-
-# Option C: Mixed — random + hard combined (recommended)
-# model = EmbeddingModel("BAAI/bge-base-en-v1.5")
-# triplets = build_mixed_negatives(dataset, model, n_random=2, n_hard=1, top_k=50)
-
-torch_ds = TripletDataset(triplets)
-
-# 3. Configure and train
-config = TrainingConfig(
-    epochs=3,
-    batch_size=4,
-    lr=2e-5,
-    mixed_precision="bf16",            # AMP for faster training
-    dtype="bf16",                      # load base model in bf16 to save memory
-    lora=LoRASettings(r=8, alpha=16),
-    save_dir="./my-adapter",
-    save_every_n_steps=100,            # checkpoint every 100 optimizer steps
-    keep_all_checkpoints=False,        # only keep latest checkpoint
-)
-trainer = Trainer("BAAI/bge-base-en-v1.5", config)
-history = trainer.train(torch_ds)
-
-# 4. Evaluate
-evaluator = Evaluator("BAAI/bge-base-en-v1.5", adapter_path="./my-adapter", dtype="bf16")
-result = evaluator.evaluate("fiqa", split="test", k_values=[1, 5, 10])
-result.print()
-result.save("eval_results.json")
-
-# 5. Use for inference
-model = EmbeddingModel("BAAI/bge-base-en-v1.5", adapter_path="./my-adapter", dtype="bf16")
-query_emb = model.encode(["What is compound interest?"])
-doc_emb = model.encode(["Compound interest is interest calculated on the initial principal..."])
-
-# Compute similarity
-import torch
-similarity = torch.mm(query_emb, doc_emb.t())  # cosine sim (already L2-normalized)
-print(f"Similarity: {similarity.item():.4f}")
-```
-
-### Writing a custom training script
-
-If your data doesn't come from BEIR or JSONL files, you can skip the data loading entirely and wire things up yourself. The key insight is that every component is independent:
-
-- **`RetrievalDataset`** is just three dicts — build it from any source
-- **`build_random_negatives` / `mine_hard_negatives` / `build_mixed_negatives`** take a `RetrievalDataset` and return `list[Triplet]`
-- **`TripletDataset`** wraps triplets for PyTorch — or you can construct `Triplet` objects directly
-- **`Trainer`** takes a `TripletDataset` and returns `TrainHistory`
-- **`Evaluator.evaluate()`** accepts a `RetrievalDataset` directly via the `dataset=` parameter
-
-Here's an example loading data from a pandas DataFrame and a CSV:
-
-```python
-import pandas as pd
-from khoji import (
-    RetrievalDataset,
-    Evaluator,
-    LoRASettings,
-    Trainer,
-    TrainingConfig,
-    TripletDataset,
-    build_mixed_negatives,
-    build_random_negatives,
-    mine_hard_negatives,
-    EmbeddingModel,
-)
-from khoji.data import Triplet
-
-# ──────────────────────────────────────────────────────────
-# 1. Load YOUR data from whatever source you have
-# ──────────────────────────────────────────────────────────
-
-# Example: customer support tickets from a CSV
-tickets = pd.read_csv("support_tickets.csv")  # columns: ticket_id, question, resolution
-kb = pd.read_csv("knowledge_base.csv")        # columns: article_id, content
-labels = pd.read_csv("labels.csv")            # columns: ticket_id, article_id, relevance
-
-# Build RetrievalDataset from your dataframes
-train_dataset = RetrievalDataset(
-    queries={str(r.ticket_id): r.question for r in tickets.itertuples()},
-    corpus={str(r.article_id): r.content for r in kb.itertuples()},
-    qrels={
-        str(tid): {str(aid): int(rel) for _, aid, rel in group.itertuples()}
-        for tid, group in labels.groupby("ticket_id")
-    },
-)
-
-# ──────────────────────────────────────────────────────────
-# 2. Build triplets — choose your strategy
-# ──────────────────────────────────────────────────────────
-
-# Option A: Random negatives (fast, no model needed)
-triplets = build_random_negatives(train_dataset, n_negatives=3)
-
-# Option B: Hard negatives (better quality, needs model encoding)
-# base_model = EmbeddingModel("BAAI/bge-base-en-v1.5")
-# triplets = mine_hard_negatives(train_dataset, base_model, n_negatives=3, top_k=50)
-
-# Option C: Mixed — random + hard combined (recommended for balanced training)
-# base_model = EmbeddingModel("BAAI/bge-base-en-v1.5")
-# triplets = build_mixed_negatives(train_dataset, base_model, n_random=2, n_hard=1, top_k=50)
-
-# Option D: Build triplets yourself if you have your own mining logic
-# triplets = [
-#     Triplet(query="...", positive="...", negative="...")
-#     for query, pos, neg in your_custom_mining_function()
-# ]
-
-# ──────────────────────────────────────────────────────────
-# 3. Train
-# ──────────────────────────────────────────────────────────
-
-config = TrainingConfig(
-    epochs=5,
-    batch_size=4,
-    grad_accum_steps=4,        # effective batch size = 16
-    lr=2e-5,
-    weight_decay=0.01,         # AdamW weight decay
-    warmup_steps=50,
-    max_grad_norm=1.0,         # gradient clipping
-    mixed_precision="bf16",    # AMP for faster training
-    dtype="bf16",              # load base model in bf16 to save memory
-    lora=LoRASettings(r=16, alpha=32),
-    save_dir="./support-adapter",
-    sanity_check_samples=10,   # verify training is working
-    save_every_n_steps=200,    # checkpoint every 200 optimizer steps
-    keep_all_checkpoints=False,# only keep latest
-)
-
-trainer = Trainer("BAAI/bge-base-en-v1.5", config)
-history = trainer.train(TripletDataset(triplets))
-
-# Plot training curves
-import matplotlib.pyplot as plt
-
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-axes[0].plot(history.step_loss)
-axes[0].set_title("Loss per step")
-axes[1].plot(history.step_lr)
-axes[1].set_title("Learning rate")
-axes[2].plot(history.step_grad_norm)
-axes[2].set_title("Gradient norm")
-plt.tight_layout()
-plt.savefig("training_curves.png")
-
-# ──────────────────────────────────────────────────────────
-# 4. Evaluate — on your own test set OR a standard benchmark
-# ──────────────────────────────────────────────────────────
-
-evaluator = Evaluator("BAAI/bge-base-en-v1.5", adapter_path="./support-adapter", dtype="bf16")
-
-# Evaluate on your own held-out data (pass dataset directly)
-test_dataset = RetrievalDataset(
-    queries={"t1": "how to reset password", "t2": "refund policy"},
-    corpus={...},   # your test corpus
-    qrels={...},    # your test relevance judgments
-)
-custom_result = evaluator.evaluate(dataset=test_dataset, k_values=[1, 5, 10])
-custom_result.print()
-
-# Also evaluate on a standard BEIR benchmark for comparison
-beir_result = evaluator.evaluate(dataset_name="fiqa", split="test", k_values=[1, 5, 10])
-beir_result.print()
-
-# ──────────────────────────────────────────────────────────
-# 5. Use the fine-tuned model for inference
-# ──────────────────────────────────────────────────────────
-
-model = EmbeddingModel("BAAI/bge-base-en-v1.5", adapter_path="./support-adapter", dtype="bf16")
-
-# Encode a user query and your knowledge base
-query_emb = model.encode(["How do I reset my password?"])
-kb_embs = model.encode(["To reset your password, go to ...", "Refund policy: ...", ...])
-
-# Find most relevant articles
-import torch
-scores = torch.mm(query_emb, kb_embs.t()).squeeze(0)
-top_indices = torch.topk(scores, k=5).indices.tolist()
-# top_indices now contains the indices of the 5 most relevant KB articles
-```
-
-### `RunResult`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `history` | `TrainHistory` | Training metrics per step and per epoch |
-| `baseline` | `EvalResult \| None` | Baseline evaluation (None if `run_before: false`) |
-| `finetuned` | `EvalResult \| None` | Fine-tuned evaluation (None if `run_after: false`) |
-| `adapter_dir` | `str \| None` | Path to saved LoRA adapter |
-| `config` | `ForgeConfig \| None` | The config used for this run |
-
-### `TrainHistory`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `step_loss` | `list[float]` | Loss per optimizer step |
-| `step_lr` | `list[float]` | Learning rate per optimizer step |
-| `step_grad_norm` | `list[float]` | Gradient L2 norm per optimizer step |
-| `epoch_loss` | `list[float]` | Average loss per epoch |
-
-### `EvalResult`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `metrics` | `dict[str, float]` | Metric name to value (e.g., `{"ndcg@1": 0.45, "mrr@5": 0.52}`) |
-| `model_name` | `str` | Model used |
-| `dataset_name` | `str` | Dataset evaluated on |
-| `split` | `str` | Split evaluated on |
-| `num_queries` | `int` | Number of queries evaluated |
-| `num_corpus` | `int` | Corpus size |
-| `k_values` | `list[int]` | K values used |
-| `timestamp` | `str` | ISO timestamp |
-
-| Method | Description |
-|--------|-------------|
-| `print()` | Pretty-print results as a formatted table |
-| `save(path)` | Save to JSON file |
-| `to_dict()` | Convert to dictionary with all metadata |
-
----
-
-## Supported Models
-
-Any HuggingFace model compatible with `AutoModel` / `AutoTokenizer` is supported. The library auto-detects:
-
-- **Pooling strategy** from the model's `1_Pooling/config.json` (sentence-transformers convention). Supported modes: CLS, Mean, Max, WeightedMean, LastToken, Mean-sqrt-len. Falls back to CLS if config is not found.
-- **LoRA target modules** from model architecture (see [LoRA config](#lora) table above).
-
-**Tested models:**
+Any HuggingFace model compatible with `AutoModel` / `AutoTokenizer`. Pooling is auto-detected from the model's sentence-transformers config.
 
 | Model | Pooling | Architecture |
 |-------|---------|-------------|
 | `BAAI/bge-base-en-v1.5` | CLS | BERT |
 | `sentence-transformers/all-MiniLM-L6-v2` | Mean | BERT |
 
----
+Auto-detected LoRA targets per architecture:
 
-## Extensibility
-
-Every major component is pluggable. You can bring your own model, loss function, or metrics without forking the library.
-
-### Full fine-tuning (no LoRA)
-
-By default, khoji uses LoRA for parameter-efficient training. To train **all model parameters** instead, set `lora: null` in your YAML config:
-
-```yaml
-lora: null    # train all parameters, not just LoRA adapters
-
-train:
-  epochs: 3
-  lr: 1e-5    # use a lower learning rate for full fine-tuning
-```
-
-Or via the Python API:
-
-```python
-from khoji import Trainer, TrainingConfig
-
-config = TrainingConfig(
-    epochs=3,
-    lr=1e-5,
-    lora=None,    # full fine-tuning
-    save_dir="./my-full-model",
-)
-trainer = Trainer("BAAI/bge-base-en-v1.5", config)
-```
-
-**Notes:**
-- Full fine-tuning trains and saves **all** model weights (hundreds of MB), whereas LoRA only saves adapter weights (~few MB).
-- Use a lower learning rate (`1e-5` to `5e-6`) compared to LoRA fine-tuning to avoid catastrophic forgetting.
-- Requires more GPU memory since all parameters need gradients.
-
-### Custom models (non-HuggingFace)
-
-If you have a custom PyTorch encoder (not from HuggingFace), pass it directly to `EmbeddingModel`, `Trainer`, and `Evaluator`. The only requirement is:
-
-- **Model**: a `torch.nn.Module` that returns an object with a `.last_hidden_state` attribute (shape `batch, seq_len, hidden_dim`) when called with tokenizer outputs.
-- **Tokenizer**: anything that supports `tokenizer(texts, padding=True, truncation=True, max_length=N, return_tensors="pt")` and returns a dict with `"attention_mask"`.
-
-```python
-import torch
-import torch.nn as nn
-from khoji import EmbeddingModel, Trainer, TrainingConfig, Evaluator
-
-# Example: a simple custom encoder
-class MyEncoder(nn.Module):
-    def __init__(self, vocab_size=30000, hidden_dim=256):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, batch_first=True),
-            num_layers=4,
-        )
-
-    def forward(self, input_ids, attention_mask=None, **kwargs):
-        x = self.embedding(input_ids)
-        x = self.transformer(x)
-        # Return an object with .last_hidden_state (like HuggingFace models)
-        return type("Output", (), {"last_hidden_state": x})()
-
-my_model = MyEncoder()
-my_tokenizer = ...  # your tokenizer
-
-# Use for inference
-embedding_model = EmbeddingModel(
-    model=my_model,
-    tokenizer=my_tokenizer,
-    pooling="mean",       # "cls", "mean", "max", "weightedmean", "lasttoken", "mean_sqrt_len"
-    max_length=512,       # max token length
-)
-embeddings = embedding_model.encode(["hello world"])
-
-# Use for training (set lora=None to train the full model, or keep LoRA)
-trainer = Trainer(
-    model=my_model,
-    tokenizer=my_tokenizer,
-    pooling="mean",
-    config=TrainingConfig(
-        epochs=3,
-        lora=None,              # no LoRA for custom models (trains full model)
-        mixed_precision="bf16", # AMP still works with custom models
-    ),
-)
-
-# Use for evaluation
-evaluator = Evaluator(embedding_model=embedding_model)
-result = evaluator.evaluate(dataset_name="fiqa", split="test")
-```
-
-### Custom loss functions
-
-The `TrainingConfig.loss_fn` accepts any callable with the signature:
-
-```python
-def my_loss(
-    query_emb: torch.Tensor,     # (batch, dim), L2-normalized
-    positive_emb: torch.Tensor,  # (batch, dim), L2-normalized
-    negative_emb: torch.Tensor,  # (batch, dim), L2-normalized
-) -> torch.Tensor:               # scalar loss
-```
-
-```python
-import torch
-from khoji import Trainer, TrainingConfig, LoRASettings
-
-# Example: custom circle loss
-def circle_loss(query_emb, positive_emb, negative_emb, margin=0.25, gamma=64):
-    pos_sim = torch.nn.functional.cosine_similarity(query_emb, positive_emb)
-    neg_sim = torch.nn.functional.cosine_similarity(query_emb, negative_emb)
-
-    alpha_p = torch.clamp(1 + margin - pos_sim, min=0)
-    alpha_n = torch.clamp(neg_sim + margin, min=0)
-
-    logit_p = -gamma * alpha_p * (pos_sim - (1 - margin))
-    logit_n = gamma * alpha_n * (neg_sim - margin)
-
-    loss = torch.nn.functional.softplus(logit_n - logit_p)
-    return loss.mean()
-
-# Use it
-config = TrainingConfig(
-    loss_fn=circle_loss,  # pass your function directly
-    lora=LoRASettings(r=8, alpha=16),
-)
-trainer = Trainer("BAAI/bge-base-en-v1.5", config)
-```
-
-Through YAML, only the built-in losses (`triplet`, `infonce`, `contrastive`) are available. Custom losses require the Python API.
-
-### Custom metrics
-
-The `Evaluator.evaluate()` accepts `extra_metrics` — a dict of metric functions that are computed alongside the built-in nDCG, MRR, and Recall. Each function must have the signature:
-
-```python
-def my_metric(
-    ranked_doc_ids: list[str],     # doc IDs ranked by similarity (most similar first)
-    qrel: dict[str, int],         # ground truth: {doc_id: relevance_score}
-    k: int,                        # cutoff
-) -> float:                        # per-query score (averaged across all queries)
-```
-
-```python
-from khoji import Evaluator
-
-# Example metrics
-def precision_at_k(ranked_doc_ids, qrel, k):
-    """Fraction of top-k results that are relevant."""
-    relevant = {d for d, s in qrel.items() if s > 0}
-    found = sum(1 for d in ranked_doc_ids[:k] if d in relevant)
-    return found / k
-
-def hit_rate_at_k(ranked_doc_ids, qrel, k):
-    """1 if any relevant doc is in top-k, else 0."""
-    relevant = {d for d, s in qrel.items() if s > 0}
-    return 1.0 if any(d in relevant for d in ranked_doc_ids[:k]) else 0.0
-
-# Use them
-evaluator = Evaluator("BAAI/bge-base-en-v1.5", adapter_path="./my-adapter")
-result = evaluator.evaluate(
-    dataset_name="fiqa",
-    split="test",
-    k_values=[1, 5, 10],
-    extra_metrics={
-        "precision": precision_at_k,
-        "hit_rate": hit_rate_at_k,
-    },
-)
-
-# Results include both built-in and custom metrics
-# {"ndcg@5": 0.42, "mrr@5": 0.51, "recall@5": 0.65, "precision@5": 0.12, "hit_rate@5": 0.78, ...}
-print(result.metrics)
-```
-
-The built-in metric functions (`ndcg_at_k`, `mrr_at_k`, `recall_at_k`) are also exported from the package, so you can reuse them in custom evaluation scripts:
-
-```python
-from khoji import ndcg_at_k, mrr_at_k, recall_at_k
-
-ranked = ["d3", "d1", "d5", "d2"]
-qrel = {"d1": 2, "d5": 1}
-
-print(ndcg_at_k(ranked, qrel, k=3))   # 0.7654
-print(mrr_at_k(ranked, qrel, k=3))    # 0.5
-print(recall_at_k(ranked, qrel, k=3)) # 1.0
-```
+| Architecture | Target Modules |
+|-------------|---------------|
+| BERT, RoBERTa, XLM-RoBERTa | `query`, `key`, `value` |
+| DistilBERT | `q_lin`, `k_lin`, `v_lin` |
+| DeBERTa (v1/v2) | `query_proj`, `key_proj`, `value_proj` |
+| Mistral, LLaMA | `q_proj`, `k_proj`, `v_proj` |
 
 ---
 
-## Example Configs
+### 2. Text → Image
 
-Four configs are included for different use cases:
+Fine-tune cross-modal models (CLIP, SigLIP) where queries are text and documents are images.
 
-### `configs/fiqa_quick.yaml` — Quick iteration
-- 50 training queries, random negatives
-- 2 epochs, batch_size=4, grad_accum_steps=4
-- Evaluation disabled for speed
-- Good for testing config changes and verifying the pipeline
-
-### `configs/fiqa_full.yaml` — Full training
-- All queries, hard negative mining (top_k=50, n_negatives=3)
-- 5 epochs, batch_size=32, InfoNCE loss
-- LoRA rank=16, alpha=32
-- Full baseline + fine-tuned evaluation on all test queries
-
-### `configs/fiqa_mixed.yaml` — Mixed negatives
-- All queries, 2 random + 1 hard negative per pair
-- 2 epochs, batch_size=32, InfoNCE loss
-- LoRA rank=16, alpha=32, target_modules: [query, key, value, dense]
-- Random negatives provide easy training signal, hard negatives push fine-grained ranking
-
-### `configs/fiqa_overfit.yaml` — Debug pipeline
-- 1 batch, 50 epochs, lr=1e-3, no dropout
-- Verifies training can drive loss to zero and margins improve
-- Reports per-sample cosine similarity before and after training
-- No evaluation (pure training loop verification)
-
----
-
-## Evaluation Metrics
-
-All metrics are implemented from scratch (no external IR evaluation libraries).
-
-| Metric | Description |
-|--------|-------------|
-| **nDCG@k** | Normalized Discounted Cumulative Gain. Measures ranking quality with graded relevance. Accounts for position — relevant docs ranked higher contribute more. 1.0 = perfect ranking. |
-| **MRR@k** | Mean Reciprocal Rank. 1 / position of the first relevant result. Focuses on where the first relevant result appears. 1.0 = relevant doc is the first result. |
-| **Recall@k** | Fraction of all relevant documents found in the top-k results. Measures coverage. 1.0 = all relevant docs retrieved within top-k. |
-
----
-
-## Hardware
-
-The library auto-detects the best available device:
-
-| Device | Priority | Notes |
-|--------|----------|-------|
-| CUDA | 1st | NVIDIA GPUs. Best performance. |
-| MPS | 2nd | Apple Silicon (M1/M2/M3). Uses shared GPU/CPU memory. |
-| CPU | 3rd | Fallback. Slower but always works. |
-
-**MPS tips:**
-- If you see `MPS backend out of memory`, reduce `batch_size` (e.g., to 4) and increase `grad_accum_steps` to maintain effective batch size.
-- The effective batch size (`batch_size * grad_accum_steps`) is what matters for training dynamics. Smaller micro-batches with more accumulation steps gives equivalent results with less peak memory.
-
-### Model Precision
-
-There are **two independent precision controls** — one for how model weights are stored in memory, and one for how computations are done during training:
-
-#### `model.dtype` — Base model weight precision
-
-Controls the precision of the **base model weights** when loaded from HuggingFace. LoRA adapter weights are always kept in fp32 for training stability.
+#### Config-driven
 
 ```yaml
 model:
-  name: BAAI/bge-base-en-v1.5
-  dtype: bf16    # load base model in bfloat16 (saves ~50% memory)
-```
+  name: openai/clip-vit-base-patch32
+  # adapter_path: null
+  # dtype: null
+  lora_target: both              # "vision", "text", or "both"
 
-| Value | Memory | Description |
-|-------|--------|-------------|
-| `null` | 100% | Default. Full fp32 precision. |
-| `fp16` | ~50% | Half precision. Good for inference and memory-constrained setups. |
-| `bf16` | ~50% | BFloat16. Same range as fp32, recommended for training. |
-
-This setting applies everywhere the base model is loaded: training, evaluation, hard negative mining, and inference.
-
-#### `train.mixed_precision` — Training computation precision
-
-Controls automatic mixed precision (AMP) during the **forward/backward pass**. This is separate from `model.dtype`:
-
-```yaml
-train:
-  mixed_precision: bf16   # or "fp16"
-```
-
-| Mode | When to use |
-|------|-------------|
-| `bf16` | Recommended for modern GPUs (Ampere+). Same dynamic range as fp32, no grad scaling needed. |
-| `fp16` | Wider GPU support. Uses gradient scaling automatically to prevent underflow. |
-| `null` | Default. Full fp32 precision. |
-
-#### Combining both
-
-You can use both together for maximum memory savings:
-
-```yaml
-model:
-  dtype: bf16              # load base weights in bf16
-train:
-  mixed_precision: bf16    # run forward/backward in bf16
-```
-
-**Notes:**
-- On **CUDA**, both `fp16` and `bf16` work. `bf16` is preferred on Ampere+ GPUs (A100, RTX 3090+).
-- On **MPS** (Apple Silicon), `bf16` has limited support. Use with caution or stick with `null`.
-- On **CPU**, mixed precision has minimal benefit.
-- Gradient scaling is handled automatically for `fp16` (via `torch.amp.GradScaler`). `bf16` does not require scaling.
-
----
-
-## Text-to-Image Retrieval
-
-khoji supports cross-modal retrieval where queries are text and documents are images. It works with CLIP and SigLIP models out of the box.
-
-### Quick start (CLI)
-
-```bash
-khoji init                              # generates example configs
-khoji multimodal flickr30k_quick.yaml   # train on Flickr30k
-```
-
-### Quick start (Python API)
-
-```python
-from khoji import MultimodalEmbeddingModel, MultimodalForgeConfig, run_multimodal
-
-# Inference with CLIP
-model = MultimodalEmbeddingModel("openai/clip-vit-base-patch32")
-text_emb = model.encode_text(["a dog playing fetch"])
-img_emb = model.encode_image_sources(["photos/dog.jpg"], base_dir="./my_data")
-
-import torch
-similarity = torch.mm(text_emb, img_emb.t())
-print(f"Similarity: {similarity.item():.4f}")
-
-# Full training pipeline
-config = MultimodalForgeConfig.from_yaml("flickr30k_quick.yaml")
-result = run_multimodal(config)
-```
-
-### Multimodal configuration reference
-
-```yaml
-# ── Model ─────────────────────────────────────────────────────────
-model:
-  name: openai/clip-vit-base-patch32   # CLIP or SigLIP model
-  adapter_path: null                    # path to existing adapter
-  dtype: null                           # "fp16", "bf16", or null
-  lora_target: both                     # "vision", "text", or "both"
-
-# ── Data ──────────────────────────────────────────────────────────
 data:
-  dataset: nlphuji/flickr30k            # HF dataset or local path
+  dataset: nlphuji/flickr30k     # or "arampacha/rsicd" or local path
   split: train
-  negatives: random                     # "random" or "hard"
+  negatives: random
   n_negatives: 1
-  n_queries: null                       # null = all
-  corpus_size: null                     # null = all
-  top_k: 50                             # for hard negative mining
-  cache_dir: null                       # cache downloaded images
+  cache_dir: null                 # cache downloaded images locally
+  # ... all other data params same as text-to-text
 
-# ── LoRA ──────────────────────────────────────────────────────────
-# Set to null for full fine-tuning: lora: null
 lora:
   r: 8
   alpha: 16
   dropout: 0.1
-  target_modules: null                  # auto-detect (q_proj, k_proj, v_proj for CLIP)
 
-# ── Training ──────────────────────────────────────────────────────
 train:
   epochs: 3
   batch_size: 8
-  grad_accum_steps: 4
   lr: 2e-5
-  max_length: 77                        # CLIP default token length
+  max_length: 77                  # CLIP default
   loss: infonce
   temperature: 0.05
-  mixed_precision: bf16
   # ... all other train params same as text-to-text
 
-# ── Image Preprocessing (optional overrides) ─────────────────────
+# Optional: override image preprocessing
 # preprocess:
 #   image_size: 224
 #   mean: [0.48145466, 0.4578275, 0.40821073]
 #   std: [0.26862954, 0.26130258, 0.27577711]
-
-seed: 42
 
 eval:
   k_values: [1, 5, 10]
@@ -1129,249 +310,94 @@ eval:
 output_dir: ./forge-output/flickr30k
 ```
 
-#### `model` (multimodal)
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `name` | `str` | `openai/clip-vit-base-patch32` | CLIP or SigLIP model from HuggingFace. |
-| `adapter_path` | `str \| null` | `null` | Path to existing LoRA adapter. |
-| `dtype` | `str \| null` | `null` | Load model in "fp16", "bf16", or null (fp32). |
-| `lora_target` | `str` | `both` | Which encoder(s) to apply LoRA to: `"vision"`, `"text"`, or `"both"`. |
-
-#### `data` (multimodal)
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dataset` | `str` | `nlphuji/flickr30k` | HF dataset name or path to local directory. |
-| `cache_dir` | `str \| null` | `null` | Cache directory for downloaded images. `null` = stream without saving. |
-
-All other data/train/eval parameters are the same as text-to-text.
-
-#### `preprocess` (optional)
-
-Controls how images are resized and normalized before being fed to the vision encoder. There are **three tiers** of preprocessing, from most to least automatic:
-
-**Tier 1 — Auto (default):** When `preprocess` is omitted, khoji loads the model's `AutoProcessor` from HuggingFace. For CLIP ViT-B/32 this means: resize to 224px, center crop, normalize with `mean=[0.481, 0.458, 0.408]`, `std=[0.269, 0.261, 0.276]`. This is the right default for standard models.
-
-**Tier 2 — YAML overrides:** Set specific values to override the auto-detected ones. Useful when using a fine-tuned CLIP variant trained at a different resolution, or when your domain images have unusual color distributions (e.g., medical imaging, satellite imagery):
-
-```yaml
-preprocess:
-  image_size: 336          # override resize (e.g., for ViT-L/14@336px)
-  mean: [0.5, 0.5, 0.5]   # custom normalization
-  std: [0.5, 0.5, 0.5]
+```bash
+khoji multimodal flickr30k_quick.yaml
 ```
 
-**Tier 3 — Custom callable (Python API only):** Pass your own preprocessing function for full control — custom augmentations, domain-specific transforms, etc. This works with both HuggingFace and custom models:
-
-```python
-import torch
-import torchvision.transforms as T
-from PIL import Image
-
-# Example: custom preprocessing with augmentation
-transform = T.Compose([
-    T.Resize(224),
-    T.CenterCrop(224),
-    T.RandomHorizontalFlip(p=0.5),  # augmentation for training
-    T.ToTensor(),
-    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
-
-def my_preprocessor(images: list[Image.Image]) -> torch.Tensor:
-    return torch.stack([transform(img) for img in images])
-
-# Use with HuggingFace model — overrides the auto-detected preprocessor
-from khoji import MultimodalEmbeddingModel, MultimodalTrainer, MultimodalTrainingConfig
-
-model = MultimodalEmbeddingModel(
-    "openai/clip-vit-base-patch32",
-    image_processor=my_preprocessor,  # overrides AutoProcessor
-)
-
-trainer = MultimodalTrainer(
-    "openai/clip-vit-base-patch32",
-    image_processor=my_preprocessor,  # also works in training
-    config=MultimodalTrainingConfig(...),
-)
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `image_size` | `int \| null` | `null` | Override shortest-edge resize. `null` = auto from model (224 for CLIP ViT-B/32). |
-| `mean` | `list[float] \| null` | `null` | Override normalization mean `[R, G, B]`. `null` = auto from model. |
-| `std` | `list[float] \| null` | `null` | Override normalization std `[R, G, B]`. `null` = auto from model. |
-
-### Custom image datasets
-
-Create a directory with three files:
-
-```
-my_image_dataset/
-  queries.jsonl      # {"_id": "q1", "text": "a dog playing fetch"}
-  corpus.jsonl       # {"_id": "d1", "image": "images/dog.jpg"}   (relative path or URL)
-  qrels.tsv          # q1\td1\t1
-  images/            # local images (optional if using URLs)
-```
-
-**corpus.jsonl** uses an `image` field instead of `text`:
-```json
-{"_id": "d1", "image": "images/photo1.jpg"}
-{"_id": "d2", "image": "https://example.com/photo2.jpg"}
-```
-
-Image paths are relative to the dataset directory. URLs are also supported — they are streamed and not saved to disk unless `cache_dir` is set.
-
-### LoRA targeting for multimodal models
-
-Control which encoder(s) LoRA is applied to:
-
-```yaml
-model:
-  lora_target: vision    # only fine-tune the vision encoder
-```
-
-| Value | What's trained | When to use |
-|-------|---------------|-------------|
-| `both` | Text + vision encoders | Default. Best for domain adaptation. |
-| `vision` | Vision encoder only | When text understanding is already good, images are domain-specific. |
-| `text` | Text encoder only | When images are generic but queries are domain-specific. |
-
-### Multimodal Python API (component-by-component)
+#### Python API
 
 ```python
 from khoji import (
-    MultimodalEmbeddingModel,
-    MultimodalEvaluator,
-    MultimodalTrainer,
-    MultimodalTrainingConfig,
-    MultimodalTripletDataset,
-    MultimodalRetrievalDataset,
-    build_random_negatives_multimodal,
-    load_custom_multimodal,
-    LoRASettings,
+    MultimodalEmbeddingModel, MultimodalEvaluator,
+    MultimodalTrainer, MultimodalTrainingConfig,
+    MultimodalTripletDataset, LoRASettings,
+    load_custom_multimodal, build_random_negatives_multimodal,
 )
 
-# 1. Load dataset
+# 1. Load data
 dataset = load_custom_multimodal("./my_image_dataset")
 
 # 2. Build triplets
 triplets = build_random_negatives_multimodal(dataset, n_negatives=1)
-torch_ds = MultimodalTripletDataset(triplets)
 
 # 3. Train
 config = MultimodalTrainingConfig(
-    epochs=3,
-    batch_size=8,
-    lr=2e-5,
-    max_length=77,
+    epochs=3, batch_size=8, lr=2e-5,
     lora=LoRASettings(r=8, alpha=16),
     lora_target="both",
     save_dir="./my-clip-adapter",
     base_dir="./my_image_dataset",
 )
 trainer = MultimodalTrainer("openai/clip-vit-base-patch32", config)
-history = trainer.train(torch_ds)
+history = trainer.train(MultimodalTripletDataset(triplets))
 
 # 4. Evaluate
-evaluator = MultimodalEvaluator(
-    "openai/clip-vit-base-patch32",
-    adapter_path="./my-clip-adapter",
-)
+evaluator = MultimodalEvaluator("openai/clip-vit-base-patch32", adapter_path="./my-clip-adapter")
 result = evaluator.evaluate(dataset=dataset, k_values=[1, 5, 10])
 result.print()
 
 # 5. Inference
-model = MultimodalEmbeddingModel(
-    "openai/clip-vit-base-patch32",
-    adapter_path="./my-clip-adapter",
-)
-query_emb = model.encode_text(["a photo of a sunset"])
-img_emb = model.encode_image_sources(
-    ["sunset1.jpg", "sunset2.jpg", "cat.jpg"],
-    base_dir="./photos",
-)
+model = MultimodalEmbeddingModel("openai/clip-vit-base-patch32", adapter_path="./my-clip-adapter")
+text_emb = model.encode_text(["a photo of a sunset"])
+img_emb = model.encode_image_sources(["sunset.jpg", "cat.jpg"], base_dir="./photos")
 
 import torch
-scores = torch.mm(query_emb, img_emb.t()).squeeze(0)
-top_idx = torch.topk(scores, k=3).indices.tolist()
+scores = torch.mm(text_emb, img_emb.t()).squeeze(0)
 ```
 
-### Custom multimodal models
+#### LoRA targeting
 
-Bring your own text and vision encoders. The requirements:
+Control which encoder(s) to fine-tune:
 
-- **text_model**: `nn.Module` whose `forward(**tokenizer_outputs)` returns an object with `.pooler_output` (preferred) or `.last_hidden_state` (falls back to CLS token).
-- **vision_model**: `nn.Module` whose `forward(pixel_values)` returns an object with `.pooler_output` or `.last_hidden_state`.
-- **tokenizer**: Anything that supports `tokenizer(texts, padding=True, truncation=True, max_length=N, return_tensors="pt")`.
-- **image_processor**: Callable that takes `list[PIL.Image]` and returns a batched `torch.Tensor` of pixel values.
+| `lora_target` | What's trained | When to use |
+|---------------|---------------|-------------|
+| `both` | Text + vision encoders | Default. General domain adaptation. |
+| `vision` | Vision encoder only | Text understanding is fine, images are domain-specific (satellite, medical). |
+| `text` | Text encoder only | Images are generic, queries are domain-specific. |
 
-If you have a **single unified model** (like CLIP), pass the same module as both `text_model` and `vision_model`, or use the HuggingFace path which handles this automatically.
+#### Custom image datasets
+
+Same three-file structure as text-to-text, but `corpus.jsonl` uses an `image` field instead of `text`. Image paths are relative to the dataset directory; HTTP(S) URLs also work.
+
+```
+my_image_dataset/
+  queries.jsonl   # {"_id": "q1", "text": "a dog playing fetch"}
+  corpus.jsonl    # {"_id": "d1", "image": "images/dog.jpg"}   (relative path or URL)
+  qrels.tsv       # q1\td1\t1
+  images/         # local image files
+```
+
+Or build in Python:
 
 ```python
-import torch
-import torch.nn as nn
-from PIL import Image
-from khoji import MultimodalEmbeddingModel, MultimodalTrainer, MultimodalTrainingConfig
+from khoji import MultimodalRetrievalDataset
 
-# Example: custom vision encoder
-class MyVisionEncoder(nn.Module):
-    def __init__(self, hidden_dim=512):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 64, 7, stride=2, padding=3),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, hidden_dim),
-        )
-
-    def forward(self, pixel_values, **kwargs):
-        emb = self.conv(pixel_values)
-        return type("Output", (), {"pooler_output": emb})()
-
-# Custom image preprocessor
-def my_processor(images: list[Image.Image]) -> torch.Tensor:
-    import torchvision.transforms as T
-    transform = T.Compose([T.Resize(224), T.CenterCrop(224), T.ToTensor()])
-    return torch.stack([transform(img) for img in images])
-
-# Use for inference
-model = MultimodalEmbeddingModel(
-    text_model=my_text_encoder,
-    vision_model=MyVisionEncoder(),
-    tokenizer=my_tokenizer,
-    image_processor=my_processor,
-)
-text_emb = model.encode_text(["a satellite image of a river"])
-img_emb = model.encode_image_sources(["river.jpg"], base_dir="./images")
-
-# Use for training (lora=None to train full model)
-trainer = MultimodalTrainer(
-    text_model=my_text_encoder,
-    vision_model=MyVisionEncoder(),
-    tokenizer=my_tokenizer,
-    image_processor=my_processor,
-    config=MultimodalTrainingConfig(
-        epochs=3,
-        lora=None,        # full fine-tuning for custom models
-        base_dir="./my_dataset",
-    ),
+dataset = MultimodalRetrievalDataset(
+    queries={"q1": "a dog playing fetch"},
+    corpus={"d1": "images/dog.jpg", "d2": "images/cat.jpg"},
+    qrels={"q1": {"d1": 1}},
+    base_dir="./my_image_dataset",   # resolve relative paths from here
 )
 ```
 
-You can also **override just the preprocessor** while using a HuggingFace model:
+#### Built-in datasets
 
-```python
-# Use CLIP's text/vision encoders but with your own image preprocessing
-trainer = MultimodalTrainer(
-    "openai/clip-vit-base-patch32",
-    image_processor=my_custom_augmentation_pipeline,
-    config=MultimodalTrainingConfig(epochs=3, lora=LoRASettings(r=8, alpha=16)),
-)
-```
+| Dataset | Config name | Description |
+|---------|------------|-------------|
+| Flickr30k | `nlphuji/flickr30k` | ~30k images, 5 captions each. General purpose. |
+| RSICD | `arampacha/rsicd` | ~10k satellite/aerial images. Domain where CLIP wasn't trained. |
 
-### Supported multimodal models
+#### Supported models
 
 | Model | Type | Embedding Dim |
 |-------|------|--------------|
@@ -1381,78 +407,657 @@ trainer = MultimodalTrainer(
 
 Any CLIP or SigLIP variant on HuggingFace should work.
 
-### Built-in multimodal datasets
+---
 
-| Dataset | Source | Train | Test | Description |
-|---------|--------|-------|------|-------------|
-| Flickr30k | `nlphuji/flickr30k` | ~29k images | ~1k images | General-purpose image captioning. 5 captions per image. |
-| RSICD | `arampacha/rsicd` | 8,734 images | 1,093 images | Satellite/aerial imagery. Domain-specific — CLIP wasn't trained on this. Ideal for demonstrating fine-tuning gains. |
+### 3. (Image + Text) → Image (Composed Retrieval)
 
-Images are automatically downloaded and cached locally on first use (`~/.cache/khoji/`).
+Fine-tune joint encoder models (BLIP-2) for composed image retrieval: given a reference image and a modification caption ("make it red"), retrieve the correct target image from a gallery.
+
+To try this out on FashionIQ (dress/shirt/toptee categories), download the annotations first:
+
+```bash
+python scripts/fashioniq/download_data.py
+python scripts/train_composed_retrieval_api.py --category dress
+```
+
+#### Config-driven
+
+```yaml
+model:
+  name: Salesforce/blip2-itm-vit-g
+  # adapter_path: null
+  # dtype: null
+
+data:
+  dataset: ./data/my_composed_dataset    # local directory
+  split: train
+  negatives: mixed
+  n_random: 2
+  n_hard: 1
+  top_k: 50
+  skip_top: 5
+  mining_rounds: 1
+  cache_dir: null
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+
+train:
+  epochs: 5
+  batch_size: 8
+  lr: 2e-5
+  warmup_steps: 50
+  loss: infonce
+  temperature: 0.05
+
+eval:
+  k_values: [1, 5, 10, 50]
+  run_before: true
+  run_after: true
+
+output_dir: ./output/composed-retrieval
+```
+
+```python
+from khoji import ComposedForgeConfig, run_composed
+
+config = ComposedForgeConfig.from_yaml("composed_config.yaml")
+result = run_composed(config)
+```
+
+#### Python API
+
+```python
+from khoji import (
+    JointEmbeddingModel, ComposedEvaluator,
+    ComposedTrainer, ComposedTrainingConfig,
+    ComposedTripletDataset, LoRASettings,
+    load_custom_composed, build_random_negatives_composed,
+)
+
+# 1. Load data
+dataset = load_custom_composed("./my_composed_dataset")
+
+# 2. Build triplets
+triplets = build_random_negatives_composed(dataset, n_negatives=3)
+
+# 3. Train
+config = ComposedTrainingConfig(
+    epochs=5, batch_size=8, lr=2e-5,
+    lora=LoRASettings(r=8, alpha=16),
+    save_dir="./my-composed-adapter",
+    cache_dir="./image_cache",
+)
+trainer = ComposedTrainer("Salesforce/blip2-itm-vit-g", config)
+history = trainer.train(ComposedTripletDataset(triplets))
+
+# 4. Evaluate
+evaluator = ComposedEvaluator(
+    "Salesforce/blip2-itm-vit-g", adapter_path="./my-composed-adapter"
+)
+result = evaluator.evaluate(dataset=dataset, k_values=[1, 5, 10, 50])
+result.print()
+
+# 5. Inference
+model = JointEmbeddingModel(
+    "Salesforce/blip2-itm-vit-g", adapter_path="./my-composed-adapter"
+)
+from khoji import load_image
+ref_img = load_image("reference.jpg")
+query_emb = model.encode(images=[ref_img], texts=["make it red"])
+gallery_emb = model.encode(images=[img1, img2, img3])
+
+import torch
+scores = torch.mm(query_emb, gallery_emb.t()).squeeze(0)
+best_match = scores.argmax().item()
+```
+
+#### Custom composed datasets
+
+Composed datasets differ from the other two modes in one key way: each **query is an (image, text) pair**, not just text. The query says "here's a reference image, and here's what I want changed about it." The corpus (gallery) is still just images.
+
+**Local files:**
+
+```
+my_composed_dataset/
+  queries.jsonl   # {"_id": "q1", "image": "imgs/ref.jpg", "text": "make it red"}
+  corpus.jsonl    # {"_id": "d1", "image": "imgs/target.jpg"}
+  qrels.tsv       # q1\td1\t1
+```
+
+Note that `queries.jsonl` has **both** an `image` and a `text` field. This is the key difference from the other modes.
+
+**Python dicts:**
+
+```python
+from khoji import ComposedRetrievalDataset
+
+dataset = ComposedRetrievalDataset(
+    queries={
+        "q1": ("imgs/ref_dress.jpg", "make it red"),       # (reference_image, modification_text)
+        "q2": ("imgs/ref_shirt.jpg", "shorter sleeves"),
+    },
+    corpus={
+        "d1": "imgs/red_dress.jpg",
+        "d2": "imgs/short_sleeve_shirt.jpg",
+        "d3": "imgs/other.jpg",
+    },
+    qrels={"q1": {"d1": 1}, "q2": {"d2": 1}},
+    base_dir="./my_dataset",    # resolve relative image paths from here
+)
+```
+
+#### Supported models
+
+| Model | Type | Description |
+|-------|------|-------------|
+| `Salesforce/blip2-itm-vit-g` | BLIP-2 | Joint image-text encoder with Q-Former. 256-dim shared space. |
+
+Any BLIP-2 variant on HuggingFace should work. Custom joint encoders are also supported (see [Extensibility](#extensibility)).
+
+---
+
+## Training Concepts
+
+These concepts apply across all three retrieval modes.
+
+### Loss functions
+
+| Loss | Config value | Formula | Key param | When to use |
+|------|-------------|---------|-----------|-------------|
+| **Triplet Margin** | `triplet` | `relu(d(q,p) - d(q,n) + margin)` | `margin: 0.2` | Good default. Works with small batches and random negatives. |
+| **InfoNCE** | `infonce` | Cross-entropy with in-batch negatives | `temperature: 0.05` | Best with larger batches and hard negatives. Typically strongest. |
+| **Contrastive** | `contrastive` | `-cos(q,p) + cos(q,n)` | (none) | Simple baseline. No hyperparameters beyond LR. |
+
+Custom loss functions are supported via the Python API — any `(query_emb, pos_emb, neg_emb) -> scalar` callable works.
+
+### Negative mining strategies
+
+Retrieval fine-tuning requires triplets: (query, relevant item, non-relevant item). The non-relevant item is the "negative." How you choose negatives has a big impact on what the model learns.
+
+#### Random negatives (`negatives: random`)
+
+Randomly sample non-relevant items from the corpus. Fast (no model encoding needed), and sufficient for initial training where the model needs to learn basic relevance signals.
+
+```yaml
+data:
+  negatives: random
+  n_negatives: 3       # 3 random negatives per (query, positive) pair
+```
+
+#### Hard negatives (`negatives: hard`)
+
+Encode the entire corpus and all queries with the current model, then for each query pick the **most similar non-relevant items** as negatives. These are items the model currently thinks are relevant but aren't — forcing the model to learn finer distinctions.
+
+How it works:
+1. Encode all corpus items and queries into embeddings
+2. For each query, rank corpus items by cosine similarity
+3. From the top-`top_k` results, filter out actually-relevant items
+4. Optionally skip the top N (`skip_top`) — see below
+5. Pick `n_negatives` from the remaining as hard negatives
+
+```yaml
+data:
+  negatives: hard
+  n_negatives: 3       # 3 hard negatives per (query, positive) pair
+  top_k: 50            # consider top-50 most similar corpus items
+  skip_top: 0          # how many to skip (see below)
+```
+
+#### Mixed negatives (`negatives: mixed`)
+
+Combines random and hard negatives in the same training set. Random negatives teach basic "this is clearly irrelevant" discrimination. Hard negatives push fine-grained ranking — "these two items look similar but only one is correct." This usually gives the best training signal.
+
+```yaml
+data:
+  negatives: mixed
+  n_random: 2          # 2 random negatives per pair
+  n_hard: 1            # 1 hard negative per pair
+  top_k: 50
+```
+
+Note: `n_negatives` is used by `random` and `hard` modes. `n_random` and `n_hard` are used by `mixed` mode. They are separate parameters because mixed mode needs counts for each type.
+
+#### `top_k` — mining search window
+
+When mining hard negatives, `top_k` controls how many top-ranked corpus items to consider. A larger `top_k` searches deeper but takes longer. Typical value: 50.
+
+If `top_k` is too small, you may not find enough non-relevant items (especially for queries where many top results are relevant). If it's too large, the "hard" negatives become easy (they're far down the ranking).
+
+#### `skip_top` — avoiding false negatives
+
+Most retrieval datasets have **incomplete relevance judgments** (qrels). A document might be perfectly relevant to a query but isn't labeled as such, simply because a human annotator didn't see it. These unlabeled positives tend to cluster at the very top of the model's ranking — they look relevant because they *are* relevant.
+
+If you mine these as "hard negatives," you're training the model to push away items that are actually good matches. This hurts performance.
+
+`skip_top` skips the top N non-relevant results before picking hard negatives:
+
+```yaml
+data:
+  skip_top: 5          # skip the 5 most similar non-relevant items
+  top_k: 50            # then pick from ranks 6-50
+```
+
+**When to use it:**
+- Datasets with sparse qrels (few labeled positives per query): `skip_top: 5-10`
+- Datasets with comprehensive qrels: `skip_top: 0` is fine
+- When in doubt, `skip_top: 5` is a safe default for hard/mixed negatives
+
+#### `mining_rounds` — iterative re-mining
+
+A single round of hard negative mining uses the **pretrained model** to find hard negatives. But after training, the model has improved — what was "hard" before may now be easy. Iterative mining repeats the mine-train cycle:
+
+```
+Round 1: pretrained model → mine negatives → train → adapter_r1
+Round 2: fine-tuned model (adapter_r1) → re-mine harder negatives → train → adapter_r2 (final)
+```
+
+Each round halves the learning rate to avoid overshooting as negatives get harder.
+
+```yaml
+data:
+  negatives: mixed      # only meaningful for hard/mixed (random doesn't use mining)
+  mining_rounds: 2      # 2 rounds of mine → train
+```
+
+**When to use it:**
+- 1 round is usually sufficient for most tasks
+- 2 rounds helps when the pretrained model is already reasonable on your domain and you need to push further
+- 3+ rounds has diminishing returns and risk of overfitting to hard negatives
+
+#### Choosing a strategy
+
+| Situation | Recommended |
+|-----------|------------|
+| First experiment / quick iteration | `random` with `n_negatives: 1-3` |
+| Production training | `mixed` with `n_random: 2, n_hard: 1` |
+| Squeezing last bits of performance | `mixed` with `mining_rounds: 2, skip_top: 5` |
+| Very large corpus (>1M items) | `random` first, then `hard` on a `corpus_size` subset |
+
+### LoRA vs full fine-tuning
+
+**LoRA (default)**: Only adapter weights are trained and saved (~few MB). Base model weights are frozen.
+
+```yaml
+lora:
+  r: 8        # rank (4, 8, 16, 32 — higher = more capacity)
+  alpha: 16   # scaling factor (convention: 2 * r)
+  dropout: 0.1
+```
+
+**Full fine-tuning**: All parameters are trained and saved (hundreds of MB). Use a lower learning rate.
+
+```yaml
+lora: null
+train:
+  lr: 1e-5   # lower LR to avoid catastrophic forgetting
+```
+
+### Model precision
+
+Two independent controls:
+
+| Setting | What it does | Values |
+|---------|-------------|--------|
+| `model.dtype` | Precision of base model weights in memory | `null` (fp32), `"fp16"`, `"bf16"` |
+| `train.mixed_precision` | AMP during forward/backward pass | `null` (fp32), `"fp16"`, `"bf16"` |
+
+Use both together for maximum memory savings:
+
+```yaml
+model:
+  dtype: bf16
+train:
+  mixed_precision: bf16
+```
+
+### Evaluation metrics
+
+All implemented from scratch (no external IR evaluation libraries).
+
+| Metric | Description |
+|--------|-------------|
+| **nDCG@k** | Normalized Discounted Cumulative Gain. Measures ranking quality with graded relevance. |
+| **MRR@k** | Mean Reciprocal Rank. 1 / position of the first relevant result. |
+| **Recall@k** | Fraction of all relevant documents found in top-k. |
+
+### Output structure
+
+```
+output_dir/
+  config.yaml              # saved config for reproducibility
+  train_history.json       # per-step loss, LR, grad norms, per-epoch loss
+  adapter/                 # final LoRA adapter weights
+    adapter_model.safetensors
+    adapter_config.json
+  adapter_r1/              # round 1 adapter (only when mining_rounds > 1)
+  baseline.json            # baseline eval metrics (if run_before: true)
+  finetuned.json           # fine-tuned eval metrics (if run_after: true)
+```
+
+### Result objects
+
+**`RunResult`** (returned by `run()`, `run_multimodal()`, `run_composed()`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `history` | `TrainHistory` | `step_loss`, `step_lr`, `step_grad_norm`, `epoch_loss` |
+| `baseline` | `EvalResult \| None` | Baseline metrics (None if `run_before: false`) |
+| `finetuned` | `EvalResult \| None` | Fine-tuned metrics (None if `run_after: false`) |
+| `adapter_dir` | `str \| None` | Path to saved LoRA adapter |
+
+**`EvalResult`**:
+
+| Field | Type |
+|-------|------|
+| `metrics` | `dict[str, float]` — e.g. `{"ndcg@5": 0.42, "mrr@5": 0.51}` |
+| `model_name` | `str` |
+| `dataset_name` | `str` |
+| `num_queries` | `int` |
+| `num_corpus` | `int` |
+
+Methods: `print()`, `save(path)`, `to_dict()`.
+
+---
+
+## Extensibility
+
+### Custom models (non-HuggingFace)
+
+Every mode supports custom PyTorch models. The pattern is the same across all three: you provide an `nn.Module` (which holds the trainable parameters) and one or more **encode functions** (which define how inputs become embeddings). khoji calls your encode functions during training with gradients enabled, handles L2 normalization, and applies LoRA/optimizer/scheduler around your module.
+
+The key difference between modes is **what your encode functions receive and return**:
+
+| Mode | Encode functions | Input | Output |
+|------|-----------------|-------|--------|
+| Text → Text | Wired automatically from model + tokenizer + pooling mode | — | — |
+| Text → Image | `encode_text_fn` and `encode_image_fn` | `list[str]` (texts) and `list[str]` (image file paths/URLs) | `Tensor (batch, dim)` each |
+| Composed | `encode_query_fn` and `encode_image_fn` | `(list[PIL.Image], list[str])` and `list[PIL.Image]` | `Tensor (batch, dim)` each |
+
+Note the difference: Text → Image `encode_image_fn` receives **file paths** (the trainer handles loading), while Composed `encode_image_fn` receives **PIL images** (the trainer loads images before calling your function).
+
+#### Text → Text
+
+Your model must follow the HuggingFace convention: `forward(input_ids, attention_mask, ...)` returns an object with a `.last_hidden_state` attribute of shape `(batch, seq_len, hidden_dim)`. khoji applies pooling (CLS, mean, max, etc.) on top.
+
+Your tokenizer must support `tokenizer(texts, padding=True, truncation=True, max_length=N, return_tensors="pt")`.
+
+```python
+from khoji import EmbeddingModel, Trainer, TrainingConfig
+
+# For inference / evaluation
+embedding_model = EmbeddingModel(
+    model=my_encoder,           # nn.Module
+    tokenizer=my_tokenizer,     # HuggingFace-compatible tokenizer
+    pooling="mean",             # "cls", "mean", "max", "weightedmean", "lasttoken"
+)
+embeddings = embedding_model.encode(["hello world"])
+
+# For training
+trainer = Trainer(
+    model=my_encoder,
+    tokenizer=my_tokenizer,
+    pooling="mean",
+    config=TrainingConfig(
+        epochs=3,
+        lora=None,              # full fine-tuning (LoRA also works if your model has attention layers)
+    ),
+)
+```
+
+#### Text → Image
+
+You provide two encode functions. Both receive strings — `encode_text_fn` gets query texts, `encode_image_fn` gets image source paths/URLs (the trainer calls `load_image()` for you within `encode_image_fn` if needed, or you handle loading yourself).
+
+The `model` parameter should be the `nn.Module` that holds all trainable parameters. Both encode functions should operate on `self.model` (or capture it in a closure) so that gradients flow through to the optimizer.
+
+```python
+from khoji import MultimodalTrainer, MultimodalTrainingConfig
+
+trainer = MultimodalTrainer(
+    model=my_clip_model,          # nn.Module holding all parameters
+    encode_text_fn=my_text_fn,    # (list[str]) -> Tensor (batch, dim)
+    encode_image_fn=my_image_fn,  # (list[str]) -> Tensor (batch, dim)  ← receives file paths
+    config=MultimodalTrainingConfig(
+        epochs=3,
+        lora=None,
+        base_dir="./my_images",   # base directory for resolving relative image paths
+    ),
+)
+```
+
+#### (Image + Text) → Image
+
+You provide two encode functions. Both receive **PIL images** (not file paths — the trainer loads images before calling your functions).
+
+- `encode_query_fn(images, texts)`: Encode (reference_image + caption) pairs jointly
+- `encode_image_fn(images)`: Encode target/gallery images
+
+```python
+from khoji import ComposedTrainer, ComposedTrainingConfig, JointEmbeddingModel
+
+# For training
+trainer = ComposedTrainer(
+    model=my_model,                # nn.Module holding all parameters
+    encode_query_fn=my_joint_fn,   # (list[PIL.Image], list[str]) -> Tensor (batch, dim)
+    encode_image_fn=my_image_fn,   # (list[PIL.Image]) -> Tensor (batch, dim)
+    config=ComposedTrainingConfig(
+        epochs=3,
+        lora=None,
+        base_dir="./my_images",
+    ),
+)
+
+# For inference / evaluation
+model = JointEmbeddingModel(
+    encoder=my_encoder_fn,  # (images: list[PIL]|None, texts: list[str]|None, device) -> Tensor
+)
+# The encoder must handle three calling patterns:
+#   encoder(images=[...], texts=None, device)      → image-only embeddings
+#   encoder(images=None, texts=[...], device)       → text-only embeddings
+#   encoder(images=[...], texts=[...], device)      → joint (image+text) embeddings
+```
+
+#### LoRA with custom models
+
+LoRA works with custom models as long as your `nn.Module` contains standard attention layers (Linear modules named `query`, `key`, `value`, `q_proj`, etc.). If your module uses non-standard names, specify them explicitly:
+
+```python
+config = TrainingConfig(
+    lora=LoRASettings(r=8, alpha=16, target_modules=["my_attn_q", "my_attn_k", "my_attn_v"]),
+)
+```
+
+If your model doesn't have attention layers suitable for LoRA, use `lora=None` for full fine-tuning.
+
+### Custom loss functions
+
+Pass any callable to `TrainingConfig.loss_fn` (Python API only):
+
+```python
+import torch
+
+def circle_loss(query_emb, positive_emb, negative_emb, margin=0.25, gamma=64):
+    pos_sim = torch.nn.functional.cosine_similarity(query_emb, positive_emb)
+    neg_sim = torch.nn.functional.cosine_similarity(query_emb, negative_emb)
+    alpha_p = torch.clamp(1 + margin - pos_sim, min=0)
+    alpha_n = torch.clamp(neg_sim + margin, min=0)
+    logit_p = -gamma * alpha_p * (pos_sim - (1 - margin))
+    logit_n = gamma * alpha_n * (neg_sim - margin)
+    return torch.nn.functional.softplus(logit_n - logit_p).mean()
+
+config = TrainingConfig(loss_fn=circle_loss, ...)
+```
+
+### Custom metrics
+
+Pass `extra_metrics` to any `Evaluator.evaluate()`:
+
+```python
+def precision_at_k(ranked_doc_ids, qrel, k):
+    relevant = {d for d, s in qrel.items() if s > 0}
+    return sum(1 for d in ranked_doc_ids[:k] if d in relevant) / k
+
+result = evaluator.evaluate(
+    dataset=my_dataset,
+    k_values=[1, 5, 10],
+    extra_metrics={"precision": precision_at_k},
+)
+# result.metrics includes both built-in and custom metrics
+```
+
+The built-in metric functions are also exported for standalone use:
+
+```python
+from khoji import ndcg_at_k, mrr_at_k, recall_at_k
+
+ranked = ["d3", "d1", "d5", "d2"]
+qrel = {"d1": 2, "d5": 1}
+print(recall_at_k(ranked, qrel, k=3))  # 1.0
+```
+
+### Custom image preprocessing (Text → Image only)
+
+Three tiers, from most to least automatic:
+
+1. **Auto (default)**: Loads `AutoProcessor` from HuggingFace.
+2. **YAML overrides**: Override specific values (`image_size`, `mean`, `std`).
+3. **Custom callable** (Python API): Full control over augmentations and transforms.
+
+```python
+import torch, torchvision.transforms as T
+from PIL import Image
+
+transform = T.Compose([T.Resize(224), T.CenterCrop(224), T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
+
+def my_preprocessor(images: list[Image.Image]) -> torch.Tensor:
+    return torch.stack([transform(img) for img in images])
+
+trainer = MultimodalTrainer(
+    "openai/clip-vit-base-patch32",
+    preprocess_overrides={"custom_fn": my_preprocessor},
+    config=MultimodalTrainingConfig(...),
+)
+```
 
 ---
 
 ## Architecture
 
 ```
-khoji/
-  # ── Text-to-text ────────────────────────────────────
-  config.py                  # YAML config (ForgeConfig)
-  run.py                     # Orchestration + CLI entry point
-  dataset.py                 # BEIR loading (load_beir, RetrievalDataset)
-  data.py                    # Triplet construction, hard negative mining
-  model.py                   # Embedding model with pooling auto-detection
-  trainer.py                 # Training loop
-  evaluator.py               # Retrieval evaluation (nDCG, MRR, Recall)
+src/khoji/
+  # ── Text → Text ──────────────────────────────
+  config.py                 ForgeConfig (YAML)
+  run.py                    run() orchestrator
+  dataset.py                load_beir, load_custom, RetrievalDataset
+  data.py                   Triplet, TripletDataset, negative mining
+  model.py                  EmbeddingModel (pooling auto-detection)
+  trainer.py                Trainer, TrainingConfig, TrainHistory
+  evaluator.py              Evaluator, EvalResult
 
-  # ── Text-to-image ───────────────────────────────────
-  multimodal_config.py       # YAML config (MultimodalForgeConfig)
-  multimodal_run.py          # Orchestration for multimodal
-  multimodal_dataset.py      # Flickr30k + custom image datasets
-  multimodal_data.py         # Multimodal triplets + negative mining
-  multimodal_model.py        # CLIP/SigLIP embedding model
-  multimodal_trainer.py      # Training with text queries + image docs
-  multimodal_evaluator.py    # Cross-modal evaluation
-  image_utils.py             # Image loading (local + URL + cache)
+  # ── Text → Image ─────────────────────────────
+  multimodal_config.py      MultimodalForgeConfig
+  multimodal_run.py         run_multimodal()
+  multimodal_dataset.py     load_flickr30k, load_rsicd, load_custom_multimodal
+  multimodal_data.py        MultimodalTriplet, negative mining
+  multimodal_model.py       MultimodalEmbeddingModel, JointEmbeddingModel
+  multimodal_trainer.py     MultimodalTrainer
+  multimodal_evaluator.py   MultimodalEvaluator
 
-  # ── Shared ──────────────────────────────────────────
-  loss.py                    # Loss functions (triplet, infonce, contrastive)
-  metrics.py                 # nDCG, MRR, Recall implementations
-  lora.py                    # LoRA configuration and application
-  device.py                  # Hardware auto-detection (CUDA > MPS > CPU)
-  example_configs.py         # Bundled YAML templates for khoji init
+  # ── (Image + Text) → Image ───────────────────
+  composed_config.py        ComposedForgeConfig
+  composed_run.py           run_composed()
+  composed_dataset.py       load_custom_composed, ComposedRetrievalDataset
+  composed_data.py          ComposedTriplet, negative mining
+  composed_trainer.py       ComposedTrainer
+  composed_evaluator.py     ComposedEvaluator
+
+  # ── Shared ────────────────────────────────────
+  loss.py                   triplet_margin_loss, infonce_loss, contrastive_loss
+  metrics.py                ndcg_at_k, mrr_at_k, recall_at_k
+  lora.py                   LoRASettings, apply_lora
+  image_utils.py            load_image, load_images_batch, build_image_processor
+  device.py                 get_device (CUDA > MPS > CPU)
 ```
 
-### Data flow
+### Data flow (all modes follow the same pattern)
 
 ```
-YAML Config
-    |
-    v
-ForgeConfig.from_yaml()
-    |
-    v
-load_beir() ──> RetrievalDataset (queries, corpus, qrels)
-    |
-    v
-┌─────────────────── mining round loop ───────────────────┐
-│                                                          │
-│  build_random_negatives()   ──> list[Triplet]            │
-│    or mine_hard_negatives()                              │
-│    or build_mixed_negatives()                            │
-│    (round 2+ uses fine-tuned model for mining)           │
-│       |                                                  │
-│       v                                                  │
-│  Trainer.train() ──> TrainHistory + adapter saved        │
-│       |                                                  │
-│       └──── adapter feeds next round's mining ───────────┘
-    |
-    v
-Evaluator.evaluate() ──> EvalResult (nDCG, MRR, Recall @ k)
-    |
-    v
-RunResult (history + baseline + finetuned + adapter_dir)
+Config (YAML or Python)
+  │
+  ├─ Dataset loading ──> queries + corpus + qrels
+  │
+  ├─ Baseline evaluation (optional)
+  │
+  └─ Mining round loop:
+       │
+       ├─ Build triplets (random / hard / mixed)
+       │    (round 2+ uses fine-tuned model for mining)
+       │
+       ├─ Trainer.train() ──> TrainHistory + adapter
+       │
+       └─ adapter feeds next round
+  │
+  ├─ Fine-tuned evaluation (optional)
+  │
+  └─ RunResult (history + baseline + finetuned + adapter_dir)
 ```
+
+---
+
+## Example Scripts
+
+| Script | Mode | Description |
+|--------|------|-------------|
+| `scripts/train_text_retrieval.py` | Text → Text | Config-driven + manual API on FiQA |
+| `scripts/train_multimodal_retrieval.py` | Text → Image | Config-driven + manual API on RSICD |
+| `scripts/train_composed_retrieval.py` | Composed | Standalone FashionIQ training (low-level) |
+| `scripts/train_composed_retrieval_api.py` | Composed | Config-driven + manual API on FashionIQ |
+| `scripts/fashioniq/download_data.py` | Data setup | Download FashionIQ annotations (required for composed scripts) |
+
+The composed retrieval scripts require FashionIQ annotations. Download them first:
+
+```bash
+python scripts/fashioniq/download_data.py          # default: ./data/fashioniq
+python scripts/fashioniq/download_data.py ./my_dir  # custom output directory
+```
+
+This downloads captions, image splits, and ASIN-to-URL mappings (~3 categories: dress, shirt, toptee). Images are fetched on-the-fly from URLs during training and cached locally. Then run either composed script:
+
+```bash
+python scripts/train_composed_retrieval.py                          # standalone low-level script
+python scripts/train_composed_retrieval.py --category shirt         # different category
+
+python scripts/train_composed_retrieval_api.py                      # uses khoji API
+python scripts/train_composed_retrieval_api.py --approach api       # manual API only
+python scripts/train_composed_retrieval_api.py --approach config    # config-driven only
+```
+
+---
+
+## Example Configs
+
+Generated by `khoji init`:
+
+| Config | Mode | Description |
+|--------|------|-------------|
+| `fiqa_quick.yaml` | Text → Text | 50 queries, random negatives, 2 epochs. Quick iteration. |
+| `fiqa_full.yaml` | Text → Text | Full dataset, hard negatives, 5 epochs, InfoNCE. |
+| `fiqa_mixed.yaml` | Text → Text | Mixed negatives (random + hard), InfoNCE. |
+| `fiqa_overfit.yaml` | Text → Text | 1 batch, 50 epochs. Pipeline debugging. |
+| `flickr30k_quick.yaml` | Text → Image | 50 queries, random negatives, 2 epochs. |
+| `flickr30k_full.yaml` | Text → Image | Full dataset, hard negatives, image caching. |
+| `flickr30k_overfit.yaml` | Text → Image | Overfit mode for debugging. |
+
+---
+
+## Hardware
+
+Auto-detected: CUDA (1st) > MPS (2nd) > CPU (3rd).
+
+**MPS tip**: If you hit OOM, reduce `batch_size` and increase `grad_accum_steps` to maintain the same effective batch size.
 
 ---
 
@@ -1461,25 +1066,25 @@ RunResult (history + baseline + finetuned + adapter_dir)
 ### Running tests
 
 ```bash
-uv run pytest tests/ -v
+uv run pytest tests/ -v    # 132 tests
 ```
 
-### Test coverage (118 tests)
+### Test coverage
 
-| Module | What's tested |
-|--------|--------------|
-| `metrics.py` | nDCG@k, MRR@k, Recall@k — edge cases, perfect/worst rankings, graded relevance, k cutoffs |
-| `model.py` | All 6 pooling modes (with/without padding), pooling auto-detection, embedding shape and L2 normalization |
-| `data.py` | TripletDataset, random negatives (determinism, relevance correctness), hard negatives (semantic similarity) |
-| `loss.py` | All 3 loss functions — shapes, values, edge cases, gradient flow |
-| `config.py` | `_resolve_dtype`, `_coerce_train_config`, YAML roundtrip/defaults/partial override |
-| `lora.py` | LoRA settings, `apply_lora`, auto-detection, custom target modules |
-| `evaluator.py` | Evaluator with custom dataset, extra metrics, save/to_dict |
-| `trainer.py` | TrainHistory save/to_dict, history fields populated correctly |
-| `dataset.py` | `load_custom` (load, titles, missing files), `RetrievalDataset` construction |
-| `device.py` | Device selection, tensor creation on selected device |
-| `integration` | BEIR dataset loading, retrieval sanity checks |
-| `multimodal` | Image loading, CLIP encoding (text + images), multimodal config, custom datasets, random negatives, training loop, LoRA targeting, cross-modal evaluation |
+| Module | Tests |
+|--------|-------|
+| `metrics.py` | nDCG, MRR, Recall — edge cases, graded relevance, k cutoffs |
+| `model.py` | All pooling modes, auto-detection, L2 normalization |
+| `data.py` | Random/hard/mixed negatives, determinism, correctness |
+| `loss.py` | All 3 losses — shapes, values, gradient flow |
+| `config.py` | YAML roundtrip, type coercion, defaults |
+| `lora.py` | apply_lora, auto-detection, custom targets |
+| `evaluator.py` | Custom datasets, extra metrics, serialization |
+| `trainer.py` | Training loop, history tracking |
+| `dataset.py` | load_custom, missing files, RetrievalDataset |
+| `multimodal` | CLIP encoding, config, datasets, training, LoRA targeting, evaluation |
+| `composed` | Dataset format, triplets, config YAML, custom model training, evaluation |
+| `integration` | BEIR loading, retrieval sanity checks |
 
 ### Linting
 
@@ -1491,19 +1096,17 @@ uv run ruff check src/ tests/
 
 ## Roadmap
 
-Planned features and known gaps:
-
-- [x] **Text-to-text retrieval** — BERT, BGE, sentence-transformers
-- [x] **Text-to-image retrieval** — CLIP, SigLIP
-- [x] **Full fine-tuning** — `lora: null` for training all parameters
-- [ ] **Validation loss tracking** — monitor loss on a held-out set during training
-- [ ] **Early stopping** — stop training when validation metric stops improving
-- [ ] **Distributed training** — multi-GPU support via DDP
-- [ ] **Checkpoint resumption** — resume training from a saved checkpoint
-- [ ] **Adapter merging** — merge LoRA weights back into base model for faster inference
-- [ ] **Benchmark suite** — automated evaluation across multiple BEIR datasets
-- [ ] **Logging integration** — Weights & Biases, TensorBoard support
-- [ ] **Image-to-image retrieval** — extend multimodal to support image queries
+- [x] Text → Text retrieval (BERT, BGE, sentence-transformers)
+- [x] Text → Image retrieval (CLIP, SigLIP)
+- [x] (Image + Text) → Image composed retrieval (BLIP-2)
+- [x] Full fine-tuning (`lora: null`)
+- [x] Custom models, loss functions, metrics
+- [ ] Validation loss tracking during training
+- [ ] Early stopping
+- [ ] Distributed training (multi-GPU via DDP)
+- [ ] Checkpoint resumption
+- [ ] Adapter merging (LoRA → base model)
+- [ ] Logging integration (W&B, TensorBoard)
 
 ---
 

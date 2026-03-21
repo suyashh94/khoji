@@ -35,6 +35,20 @@ from khoji.multimodal_run import run_multimodal
 from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
 from khoji.image_utils import load_image, load_images_batch
 
+# Composed (image+text → image)
+from khoji.composed_config import ComposedForgeConfig
+from khoji.composed_data import (
+    ComposedTriplet,
+    ComposedTripletDataset,
+    build_mixed_negatives_composed,
+    build_random_negatives_composed,
+    mine_hard_negatives_composed,
+)
+from khoji.composed_dataset import ComposedRetrievalDataset, load_custom_composed
+from khoji.composed_evaluator import ComposedEvaluator
+from khoji.composed_run import run_composed
+from khoji.composed_trainer import ComposedTrainer, ComposedTrainingConfig
+
 __all__ = [
     # Text-text
     "EmbeddingModel",
@@ -80,4 +94,17 @@ __all__ = [
     "load_images_batch",
     "mine_hard_negatives_multimodal",
     "run_multimodal",
+    # Composed (image+text → image)
+    "ComposedEvaluator",
+    "ComposedForgeConfig",
+    "ComposedRetrievalDataset",
+    "ComposedTrainer",
+    "ComposedTrainingConfig",
+    "ComposedTriplet",
+    "ComposedTripletDataset",
+    "build_mixed_negatives_composed",
+    "build_random_negatives_composed",
+    "load_custom_composed",
+    "mine_hard_negatives_composed",
+    "run_composed",
 ]
