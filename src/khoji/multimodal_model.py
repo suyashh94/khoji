@@ -397,7 +397,6 @@ class JointEmbeddingModel:
             f"type: blip-2 | device: {self.device}{dtype_str}"
         )
 
-    @torch.no_grad()
     def encode(
         self,
         images: list[Image.Image] | None = None,
@@ -426,7 +425,6 @@ class JointEmbeddingModel:
             images, texts, batch_size, show_progress
         )
 
-    @torch.no_grad()
     def _encode_blip2(
         self,
         images: list[Image.Image] | None,
