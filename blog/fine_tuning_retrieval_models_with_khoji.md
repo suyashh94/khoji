@@ -412,10 +412,15 @@ All experiments ran on a single NVIDIA H100. MiniLM and CLIP-B/32 fine-tune comf
 
 ```bash
 pip install khoji
-khoji init                                   # generate example configs
-khoji fiqa_quick.yaml                        # text → text
-khoji multimodal flickr30k_quick.yaml        # text → image
+
+# Text → text (MiniLM on SciFact)
+khoji configs/minilm_scifact_full.yaml
+
+# Text → image (CLIP on RSICD satellite imagery)
+khoji multimodal configs/clip_rsicd_full.yaml
 ```
+
+Four configs are included in `configs/`: `minilm_scifact_full.yaml`, `minilm_scifact_overfit.yaml`, `clip_rsicd_full.yaml`, and `clip_rsicd_overfit.yaml`. The `_full` configs run complete training + evaluation. The `_overfit` configs train on a single batch for pipeline debugging.
 
 For composed retrieval:
 

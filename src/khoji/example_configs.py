@@ -1,317 +1,28 @@
 """Bundled example configs for `khoji init`."""
 
 CONFIGS = {
-    "fiqa_quick.yaml": """\
-# Quick test config — small subset for fast iteration
+    "minilm_scifact_full.yaml": """\
+# Text-to-text retrieval: MiniLM on SciFact
+# A smaller model (22M params) fine-tuned on scientific claim verification
+# Usage: khoji minilm_scifact_full.yaml
 model:
-  name: BAAI/bge-base-en-v1.5
-  adapter_path: null       # path to existing adapter (for continued training)
-  dtype: null              # "fp16", "bf16", or null (fp32). Load base model in this precision
-
-data:
-  dataset: fiqa
-  split: train
-  negatives: random        # "random", "hard", or "mixed"
-  n_negatives: 1
-  n_queries: 50            # small subset for testing. null = all queries
-  corpus_size: null        # only used with hard negatives. null = full corpus
-  top_k: 50                # top-k for hard negative mining
-  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 8
-  alpha: 16
-  dropout: 0.1
-  target_modules: null     # auto-detect based on model architecture
-  # override example: target_modules: [query, key, value]
-
-train:
-  epochs: 2
-  batch_size: 4
-  grad_accum_steps: 4      # effective batch size = 4 * 4 = 16
-  lr: 2e-5
-  weight_decay: 0.01       # AdamW weight decay
-  warmup_steps: 10
-  max_grad_norm: 1.0       # gradient clipping. null = disabled
-  max_length: 512
-  loss: triplet            # "triplet", "infonce", or "contrastive"
-  margin: 0.2              # only for triplet loss
-  temperature: 0.05        # only for infonce loss
-  mixed_precision: null    # "fp16", "bf16", or null (disabled)
-  overfit_batches: null    # set to 1 to overfit on 1 batch for debugging
-  sanity_check_samples: 10 # check N training samples before/after training
-  save_every_n_steps: null # save checkpoint every N optimizer steps. null = disabled
-  keep_all_checkpoints: false  # true = keep all, false = keep only latest
-
-seed: null                 # global seed for reproducibility. null = non-deterministic
-
-eval:
-  dataset: null            # eval dataset (BEIR name or local path). null = use data.dataset
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: 20            # small subset for fast evaluation. null = all
-  corpus_size: 500         # small corpus for fast evaluation. null = full
-  run_before: false        # evaluate baseline before training
-  run_after: false         # evaluate after training
-
-output_dir: ./forge-output/fiqa-quick
-""",
-    "fiqa_full.yaml": """\
-# Full training config — uses all data
-model:
-  name: BAAI/bge-base-en-v1.5
-  adapter_path: null       # path to existing adapter (for continued training)
-  dtype: null              # "fp16", "bf16", or null (fp32). Load base model in this precision
-
-data:
-  dataset: fiqa
-  split: train
-  negatives: hard          # "random", "hard", or "mixed"
-  n_negatives: 3
-  n_queries: null          # all queries
-  corpus_size: null        # full corpus
-  top_k: 50                # top-k for hard negative mining
-  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
-  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 16
-  alpha: 32
-  dropout: 0.1
-  target_modules: null     # auto-detect based on model architecture
-
-train:
-  epochs: 5
-  batch_size: 32
-  grad_accum_steps: 1      # effective batch size = 32
-  lr: 2e-5
-  weight_decay: 0.01       # AdamW weight decay
-  warmup_steps: 100
-  max_grad_norm: 1.0       # gradient clipping. null = disabled
-  max_length: 512
-  loss: infonce            # "triplet", "infonce", or "contrastive"
-  margin: 0.2              # only for triplet loss
-  temperature: 0.05        # only for infonce loss
-  mixed_precision: bf16    # "fp16", "bf16", or null (disabled)
-  overfit_batches: null    # set to 1 to overfit on 1 batch for debugging
-  sanity_check_samples: 10 # check N training samples before/after training
-  save_every_n_steps: 200  # checkpoint every 200 optimizer steps
-  keep_all_checkpoints: false  # keep only latest checkpoint
-
-seed: 42                   # global seed for reproducibility
-
-eval:
-  dataset: null            # eval dataset (BEIR name or local path). null = use data.dataset
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: null          # all test queries
-  corpus_size: null        # full corpus
-  run_before: true         # evaluate baseline before training
-  run_after: true          # evaluate after training
-
-output_dir: ./forge-output/fiqa-full
-""",
-    "fiqa_mixed.yaml": """\
-# Mixed negatives config — random (easy) + hard (challenging) for balanced training
-model:
-  name: BAAI/bge-base-en-v1.5
-  adapter_path: null       # path to existing adapter (for continued training)
-  dtype: null              # "fp16", "bf16", or null (fp32). Load base model in this precision
-
-data:
-  dataset: fiqa
-  split: train
-  negatives: mixed         # "random", "hard", or "mixed"
-  n_random: 2              # random negatives per (query, positive) pair
-  n_hard: 1                # hard negatives per (query, positive) pair
-  n_queries: null          # all queries
-  corpus_size: null        # full corpus
-  top_k: 50                # top-k for hard negative mining
-  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
-  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 16
-  alpha: 32
-  dropout: 0.1
-  target_modules: null     # auto-detect based on model architecture
-
-train:
-  epochs: 2
-  batch_size: 32
-  grad_accum_steps: 1      # effective batch size = 32
-  lr: 2e-5
-  weight_decay: 0.01       # AdamW weight decay
-  warmup_steps: 100
-  max_grad_norm: 1.0       # gradient clipping. null = disabled
-  max_length: 512
-  loss: infonce            # "triplet", "infonce", or "contrastive"
-  margin: 0.2              # only for triplet loss
-  temperature: 0.05        # only for infonce loss
-  mixed_precision: bf16    # "fp16", "bf16", or null (disabled)
-  overfit_batches: null    # set to 1 to overfit on 1 batch for debugging
-  sanity_check_samples: 10 # check N training samples before/after training
-  save_every_n_steps: null # disabled
-  keep_all_checkpoints: false
-
-seed: 42                   # global seed for reproducibility
-
-eval:
-  dataset: null            # eval dataset (BEIR name or local path). null = use data.dataset
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: null          # all test queries
-  corpus_size: null        # full corpus
-  run_before: true         # evaluate baseline before training
-  run_after: true          # evaluate after training
-
-output_dir: ./forge-output/fiqa-mixed
-""",
-    "fiqa_overfit.yaml": """\
-# Overfit debug config — verify training pipeline works
-model:
-  name: BAAI/bge-base-en-v1.5
-  adapter_path: null       # path to existing adapter (for continued training)
-  dtype: null              # "fp16", "bf16", or null (fp32). Load base model in this precision
-
-data:
-  dataset: fiqa
-  split: train
-  negatives: random        # "random", "hard", or "mixed"
-  n_negatives: 1
-  n_queries: 5             # tiny subset
-  corpus_size: null        # not used with random negatives
-  top_k: 50                # top-k for hard negative mining
-  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 8
-  alpha: 16
-  dropout: 0.0             # no dropout for overfitting
-  target_modules: null     # auto-detect based on model architecture
-
-train:
-  epochs: 50
-  batch_size: 4
-  grad_accum_steps: 1      # effective batch size = 4
-  lr: 1e-3                 # high LR to overfit fast
-  weight_decay: 0.0        # no weight decay for overfitting
-  warmup_steps: 0
-  max_grad_norm: 1.0       # gradient clipping. null = disabled
-  max_length: 512
-  loss: triplet            # "triplet", "infonce", or "contrastive"
-  margin: 0.2              # only for triplet loss
-  temperature: 0.05        # only for infonce loss
-  mixed_precision: null    # "fp16", "bf16", or null (disabled)
-  overfit_batches: 1       # overfit on 1 batch
-  sanity_check_samples: 10 # check N training samples before/after training
-  save_every_n_steps: null # disabled for debug
-  keep_all_checkpoints: false
-
-seed: 42                   # fixed seed for reproducible debug runs
-
-eval:
-  dataset: null            # eval dataset (BEIR name or local path). null = use data.dataset
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: null          # not used (eval disabled)
-  corpus_size: null        # not used (eval disabled)
-  run_before: false        # skip eval for debug
-  run_after: false         # skip eval for debug
-
-output_dir: ./forge-output/fiqa-overfit
-""",
-    # ── Multimodal (text-to-image) configs ──────────────────────
-    "flickr30k_quick.yaml": """\
-# Quick test config for text-to-image retrieval
-# Usage: khoji multimodal flickr30k_quick.yaml
-model:
-  name: openai/clip-vit-base-patch32
-  adapter_path: null       # path to existing adapter
-  dtype: null              # "fp16", "bf16", or null (fp32)
-  lora_target: both        # "vision", "text", or "both"
-
-data:
-  dataset: nlphuji/flickr30k
-  split: train
-  negatives: random        # "random", "hard", or "mixed"
-  n_negatives: 1
-  n_queries: 50            # small subset for testing. null = all
-  corpus_size: null        # only used with hard negatives. null = full
-  top_k: 50                # top-k for hard negative mining
-  skip_top: 0              # skip top N non-relevant docs (avoids false negatives)
-  mining_rounds: 1         # iterative mining rounds (hard/mixed only)
-  cache_dir: null          # cache downloaded images. null = no caching
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 8
-  alpha: 16
-  dropout: 0.1
-  target_modules: null     # auto-detect based on model architecture
-
-train:
-  epochs: 2
-  batch_size: 4
-  grad_accum_steps: 4      # effective batch size = 16
-  lr: 2e-5
-  weight_decay: 0.01
-  warmup_steps: 10
-  max_grad_norm: 1.0
-  max_length: 77           # CLIP default token length
-  loss: infonce            # "triplet", "infonce", or "contrastive"
-  margin: 0.2              # only for triplet loss
-  temperature: 0.05        # only for infonce loss
-  mixed_precision: null    # "fp16", "bf16", or null
-  overfit_batches: null
-  sanity_check_samples: 10
-  save_every_n_steps: null
-  keep_all_checkpoints: false
-
-# preprocess:              # optional image preprocessing overrides
-#   image_size: 224
-#   mean: [0.48145466, 0.4578275, 0.40821073]
-#   std: [0.26862954, 0.26130258, 0.27577711]
-
-seed: null
-
-eval:
-  dataset: null            # eval dataset. null = use data.dataset
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: 20
-  corpus_size: 200
-  run_before: false
-  run_after: false
-
-output_dir: ./forge-output/flickr30k-quick
-""",
-    "flickr30k_full.yaml": """\
-# Full training config for text-to-image retrieval
-# Usage: khoji multimodal flickr30k_full.yaml
-model:
-  name: openai/clip-vit-base-patch32
+  name: sentence-transformers/all-MiniLM-L6-v2
   adapter_path: null
   dtype: null
-  lora_target: both        # "vision", "text", or "both"
 
 data:
-  dataset: nlphuji/flickr30k
+  dataset: scifact
   split: train
-  negatives: hard
+  negatives: mixed
   n_negatives: 3
-  n_queries: null          # all queries
-  corpus_size: null        # full corpus
+  n_random: 2
+  n_hard: 1
+  n_queries: null
+  corpus_size: null
   top_k: 50
   skip_top: 0
   mining_rounds: 1
-  cache_dir: ./image-cache # cache downloaded images locally
 
-# Set to null for full fine-tuning: lora: null
 lora:
   r: 16
   alpha: 32
@@ -320,20 +31,20 @@ lora:
 
 train:
   epochs: 5
-  batch_size: 32
+  batch_size: 16
   grad_accum_steps: 1
   lr: 2e-5
   weight_decay: 0.01
-  warmup_steps: 100
+  warmup_steps: 50
   max_grad_norm: 1.0
-  max_length: 77
+  max_length: 512
   loss: infonce
   margin: 0.2
   temperature: 0.05
-  mixed_precision: bf16
+  mixed_precision: null
   overfit_batches: null
   sanity_check_samples: 10
-  save_every_n_steps: 200
+  save_every_n_steps: null
   keep_all_checkpoints: false
 
 seed: 42
@@ -347,50 +58,50 @@ eval:
   run_before: true
   run_after: true
 
-output_dir: ./forge-output/flickr30k-full
+output_dir: ./forge-output/minilm-scifact-full
 """,
-    "flickr30k_overfit.yaml": """\
-# Overfit debug config for text-to-image retrieval
-# Usage: khoji multimodal flickr30k_overfit.yaml
+    "minilm_scifact_overfit.yaml": """\
+# Text-to-text overfit debug: MiniLM on SciFact
+# Verify the training pipeline works — loss should drop to ~0
+# Usage: khoji minilm_scifact_overfit.yaml
 model:
-  name: openai/clip-vit-base-patch32
+  name: sentence-transformers/all-MiniLM-L6-v2
   adapter_path: null
   dtype: null
-  lora_target: both
 
 data:
-  dataset: nlphuji/flickr30k
+  dataset: scifact
   split: train
   negatives: random
   n_negatives: 1
-  n_queries: 5             # tiny subset
+  n_random: 1
+  n_hard: 1
+  n_queries: 5
   corpus_size: null
   top_k: 50
   skip_top: 0
   mining_rounds: 1
-  cache_dir: null
 
-# Set to null for full fine-tuning: lora: null
 lora:
   r: 8
   alpha: 16
-  dropout: 0.0             # no dropout for overfitting
+  dropout: 0.0
   target_modules: null
 
 train:
   epochs: 50
   batch_size: 4
-  grad_accum_steps: 1      # effective batch size = 4
-  lr: 1e-3                 # high LR to overfit fast
-  weight_decay: 0.0        # no weight decay for overfitting
+  grad_accum_steps: 1
+  lr: 1e-3
+  weight_decay: 0.0
   warmup_steps: 0
   max_grad_norm: 1.0
-  max_length: 77
+  max_length: 512
   loss: triplet
   margin: 0.2
   temperature: 0.05
   mixed_precision: null
-  overfit_batches: 1       # overfit on 1 batch
+  overfit_batches: 1
   sanity_check_samples: 10
   save_every_n_steps: null
   keep_all_checkpoints: false
@@ -403,15 +114,16 @@ eval:
   split: test
   n_queries: null
   corpus_size: null
-  run_before: false        # skip eval for debug
+  run_before: false
   run_after: false
 
-output_dir: ./forge-output/flickr30k-overfit
+output_dir: ./forge-output/minilm-scifact-overfit
 """,
-    # ── RSICD (satellite imagery) configs ───────────────────────
-    "rsicd_quick.yaml": """\
-# Quick test config for text-to-image retrieval on RSICD (satellite imagery)
-# Usage: khoji multimodal rsicd_quick.yaml
+    # ── Multimodal (text-to-image) configs ──────────────────────
+    "clip_rsicd_full.yaml": """\
+# Text-to-image retrieval: CLIP ViT-B/32 on RSICD (satellite imagery)
+# CLIP wasn't trained on satellite images — fine-tuning shows clear gains
+# Usage: khoji multimodal clip_rsicd_full.yaml
 model:
   name: openai/clip-vit-base-patch32
   adapter_path: null
@@ -421,29 +133,30 @@ model:
 data:
   dataset: arampacha/rsicd
   split: train
-  negatives: random
-  n_negatives: 1
-  n_queries: 50
+  negatives: mixed
+  n_negatives: 3
+  n_random: 2
+  n_hard: 1
+  n_queries: null
   corpus_size: null
   top_k: 50
   skip_top: 0
   mining_rounds: 1
   cache_dir: null
 
-# Set to null for full fine-tuning: lora: null
 lora:
-  r: 8
-  alpha: 16
+  r: 16
+  alpha: 32
   dropout: 0.1
   target_modules: null
 
 train:
-  epochs: 2
-  batch_size: 4
-  grad_accum_steps: 4
+  epochs: 3
+  batch_size: 16
+  grad_accum_steps: 2
   lr: 2e-5
   weight_decay: 0.01
-  warmup_steps: 10
+  warmup_steps: 100
   max_grad_norm: 1.0
   max_length: 77
   loss: infonce
@@ -453,65 +166,6 @@ train:
   overfit_batches: null
   sanity_check_samples: 10
   save_every_n_steps: null
-  keep_all_checkpoints: false
-
-seed: null
-
-eval:
-  dataset: null
-  k_values: [1, 5, 10]
-  split: test
-  n_queries: 20
-  corpus_size: 200
-  run_before: false
-  run_after: false
-
-output_dir: ./forge-output/rsicd-quick
-""",
-    "rsicd_full.yaml": """\
-# Full training config for text-to-image retrieval on RSICD (satellite imagery)
-# Usage: khoji multimodal rsicd_full.yaml
-model:
-  name: openai/clip-vit-base-patch32
-  adapter_path: null
-  dtype: null
-  lora_target: both
-
-data:
-  dataset: arampacha/rsicd
-  split: train
-  negatives: hard
-  n_negatives: 3
-  n_queries: null
-  corpus_size: null
-  top_k: 50
-  skip_top: 0
-  mining_rounds: 1
-  cache_dir: null
-
-# Set to null for full fine-tuning: lora: null
-lora:
-  r: 16
-  alpha: 32
-  dropout: 0.1
-  target_modules: null
-
-train:
-  epochs: 5
-  batch_size: 32
-  grad_accum_steps: 1
-  lr: 2e-5
-  weight_decay: 0.01
-  warmup_steps: 100
-  max_grad_norm: 1.0
-  max_length: 77
-  loss: infonce
-  margin: 0.2
-  temperature: 0.05
-  mixed_precision: bf16
-  overfit_batches: null
-  sanity_check_samples: 10
-  save_every_n_steps: 200
   keep_all_checkpoints: false
 
 seed: 42
@@ -525,11 +179,12 @@ eval:
   run_before: true
   run_after: true
 
-output_dir: ./forge-output/rsicd-full
+output_dir: ./forge-output/clip-rsicd-full
 """,
-    "rsicd_overfit.yaml": """\
-# Overfit debug config for text-to-image retrieval on RSICD (satellite imagery)
-# Usage: khoji multimodal rsicd_overfit.yaml
+    "clip_rsicd_overfit.yaml": """\
+# Text-to-image overfit debug: CLIP ViT-B/32 on RSICD
+# Verify the multimodal training pipeline works
+# Usage: khoji multimodal clip_rsicd_overfit.yaml
 model:
   name: openai/clip-vit-base-patch32
   adapter_path: null
@@ -541,6 +196,8 @@ data:
   split: train
   negatives: random
   n_negatives: 1
+  n_random: 1
+  n_hard: 1
   n_queries: 5
   corpus_size: null
   top_k: 50
@@ -548,7 +205,6 @@ data:
   mining_rounds: 1
   cache_dir: null
 
-# Set to null for full fine-tuning: lora: null
 lora:
   r: 8
   alpha: 16
@@ -584,6 +240,6 @@ eval:
   run_before: false
   run_after: false
 
-output_dir: ./forge-output/rsicd-overfit
+output_dir: ./forge-output/clip-rsicd-overfit
 """,
 }
