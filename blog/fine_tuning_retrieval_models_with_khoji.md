@@ -206,6 +206,14 @@ CLIP models are trained on internet photos. They've never seen satellite imagery
 
 The fine-tuned small CLIP **surpasses the large one by 73% on nDCG@10**. Recall@10 nearly doubles — from 0.27 to 0.48. Neither model was trained on satellite imagery, but fine-tuning gives the small model domain knowledge the large model simply doesn't have.
 
+Here's what that looks like on real queries — the same text query, top-5 results before and after fine-tuning:
+
+![Satellite example: airport query](./figures/multimodal_example_1.png)
+
+![Satellite example: residential area](./figures/multimodal_example_2.png)
+
+The baseline retrieves vaguely aerial-looking images. The fine-tuned model returns actual matches.
+
 **Why not caption-then-retrieve?** An alternative is to caption each satellite image with an LLM, then do text-to-text retrieval. This works for generic images but fails here: captions like "an aerial view of land" lose the spatial and textural details that distinguish a river delta from an agricultural field. Fine-tuning the vision encoder directly preserves these features.
 
 **Catastrophic forgetting?** Because we use LoRA (rank 16, ~0.1% of parameters), the base CLIP weights are frozen. The model retains its general capabilities. If you need both domain-specific and generic performance, you can hot-swap adapters at inference time.
@@ -282,6 +290,14 @@ Composed image retrieval is the most complex mode. The query is a **pair**: a re
 The pretrained BLIP-2 can't get a single Recall@1 hit — it has no concept of "find this but different." After fine-tuning, **Recall@10 doubles** from 15% to 30%, and Recall@50 jumps from 29% to 46%.
 
 This is a case where fine-tuning doesn't just improve performance — it **enables an entirely new capability**.
+
+Here are real before/after examples — reference image + modification caption → gallery results:
+
+![Composed example: "is shiny and silver with shorter sleeves" — rank 3 → 1](./figures/composed_example_1.png)
+
+![Composed example: "is grey with black design" — rank 2 → 1](./figures/composed_example_2.png)
+
+The fine-tuned model pushes the correct target to rank #1 in both cases — it understands what "shiny and silver with shorter sleeves" means in relation to the reference dress.
 
 **Training details:** 5 epochs, random negatives, InfoNCE loss. ~13,415 optimizer steps.
 

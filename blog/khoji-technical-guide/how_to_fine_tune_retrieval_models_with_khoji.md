@@ -414,6 +414,16 @@ We ran three experiments to validate the approach across all three retrieval mod
 
 The fine-tuned small model surpasses the large one by 73%. Neither had seen satellite imagery, but fine-tuning on a few thousand examples gives domain knowledge that size alone can't provide.
 
+Here's what that looks like in practice — the same text query, before and after fine-tuning:
+
+![Satellite retrieval example: airport query](./figures/multimodal_example_1.png)
+
+The baseline retrieves vaguely aerial-looking images. The fine-tuned model retrieves actual airports with runways and terminals.
+
+![Satellite retrieval example: residential area](./figures/multimodal_example_2.png)
+
+![Satellite retrieval example: river through farmland](./figures/multimodal_example_3.png)
+
 ### Composed Retrieval: FashionIQ Dress
 
 **Setup:** Fine-tune BLIP-2 on "find this dress but different" queries.
@@ -426,6 +436,14 @@ The fine-tuned small model surpasses the large one by 73%. Neither had seen sate
 | **BLIP-2 (fine-tuned)** | **0.0638** | **0.2979** | **0.4574** |
 
 The pretrained model couldn't get a single Recall@1 hit. After fine-tuning, Recall@10 doubled. This is a case where fine-tuning doesn't improve an existing capability — it creates one from scratch.
+
+Here are real examples — the reference image, the modification caption, and the top-5 gallery results before and after:
+
+![Composed example: "is shiny and silver with shorter sleeves" — rank 3 → 1](./figures/composed_example_1.png)
+
+The target dress (shiny, silver, short sleeves) went from rank #3 to rank #1. The fine-tuned model understands the modification intent.
+
+![Composed example: "is grey with black design" — rank 2 → 1](./figures/composed_example_2.png)
 
 ### Training Curves
 
