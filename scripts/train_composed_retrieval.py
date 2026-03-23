@@ -331,11 +331,11 @@ def main():
     parser.add_argument("--data-dir", default="./data/fashioniq")
     parser.add_argument("--cache-dir", default="./data/fashioniq/image_cache")
     parser.add_argument("--negatives", default="mixed", choices=["random", "hard", "mixed"])
-    parser.add_argument("--n-random", type=int, default=2)
+    parser.add_argument("--n-random", type=int, default=4)
     parser.add_argument("--n-hard", type=int, default=1)
     parser.add_argument("--n-negatives", type=int, default=3)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--skip-top", type=int, default=0)
+    parser.add_argument("--skip-top", type=int, default=100)
     parser.add_argument("--mining-rounds", type=int, default=1,
                         help="Iterative mining rounds (re-mine with fine-tuned model)")
     parser.add_argument("--epochs", type=int, default=5)
