@@ -28,20 +28,21 @@ class TrainingConfig:
     Args:
         epochs: Number of training epochs.
         batch_size: Training batch size (actual micro-batch sent to GPU).
-        grad_accum_steps: Number of steps to accumulate gradients before
-            updating. Effective batch size = batch_size * grad_accum_steps.
+        grad_accum_steps: Gradient accumulation steps.
         lr: Learning rate.
         weight_decay: AdamW weight decay.
         warmup_steps: Number of linear warmup steps.
-        max_grad_norm: Maximum gradient norm for clipping. None = no clipping.
-        max_length: Max token length for tokenization.
-        mixed_precision: "fp16", "bf16", or None (disabled).
-        loss_fn: Loss function. Takes (query_emb, pos_emb, neg_emb) -> scalar.
-            Defaults to triplet_margin_loss.
-        lora: LoRA configuration. None = no LoRA (train full model).
-        save_dir: Directory to save the trained LoRA adapter. None = don't save.
-        save_every_n_steps: Save checkpoint every N optimizer steps. None = disabled.
-        keep_all_checkpoints: If True, keep all checkpoints. If False, keep only latest.
+        max_grad_norm: Max gradient norm for clipping. None = disabled.
+        max_length: Maximum token length (used by HuggingFace convenience path).
+        mixed_precision: "fp16", "bf16", or None.
+        loss_fn: Loss function with signature (query, pos, neg) -> scalar.
+        lora: LoRA settings. None = full fine-tuning.
+        save_dir: Directory to save adapter/model after training.
+        overfit_batches: Train on N batches only (for debugging).
+        sanity_check_samples: Check N samples before/after training.
+        save_every_n_steps: Save checkpoint every N optimizer steps.
+        keep_all_checkpoints: Keep all checkpoints (True) or only latest.
+        dtype: Load base model in "fp16", "bf16", or None.
     """
 
     epochs: int = 3
@@ -56,11 +57,11 @@ class TrainingConfig:
     loss_fn: Callable[..., torch.Tensor] = triplet_margin_loss
     lora: LoRASettings | None = None
     save_dir: str | None = None
-    overfit_batches: int | None = None  # Set to 1 (or N) to overfit on N batches for debugging
-    sanity_check_samples: int = 10  # Number of training samples to check before/after training
+    overfit_batches: int | None = None
+    sanity_check_samples: int = 10
     save_every_n_steps: int | None = None
     keep_all_checkpoints: bool = False
-    dtype: str | None = None  # Load base model weights in this precision ("fp16", "bf16", or None)
+    dtype: str | None = None
 
 
 @dataclass
@@ -90,18 +91,35 @@ class TrainHistory:
 
 
 class Trainer:
-    """Fine-tunes an embedding model on triplet data using LoRA.
+    """Fine-tunes an embedding model on triplet data.
 
-    **HuggingFace models** — pass ``model_name``:
+    **HuggingFace models** (auto-wires encode function):
 
-        Trainer("BAAI/bge-base-en-v1.5", config)
+        trainer = Trainer("BAAI/bge-base-en-v1.5", config)
 
-    **Custom PyTorch models** — pass ``model``, ``tokenizer``, and ``pooling``:
+    **Custom model** — provide nn.Module and encode function:
 
-        Trainer(model=my_encoder, tokenizer=my_tokenizer, pooling="mean", config=config)
+        trainer = Trainer(
+            model=my_model,
+            encode_fn=my_encode,  # (texts: list[str]) -> Tensor
+            config=config,
+        )
 
-    When using a custom model, LoRA is still applied via ``config.lora`` if set.
-    Set ``config.lora = None`` to skip LoRA and train the full model.
+    The ``encode_fn`` receives a batch of texts and returns a tensor of
+    shape ``(batch, embed_dim)``. Called with gradients enabled during
+    training. The library handles L2 normalization.
+
+    For HuggingFace models, the encode function is auto-wired from the
+    loaded model (tokenization, forward pass, pooling detection — all
+    packaged internally).
+
+    Args:
+        model_name: HuggingFace model name. Auto-loads and wires everything.
+        config: Training configuration.
+        model: Custom nn.Module. Required with ``encode_fn``.
+        encode_fn: Custom encoding function.
+            Signature: ``(texts: list[str]) -> Tensor (batch, dim)``.
+        adapter_path: Path to a saved LoRA adapter for warm-starting.
     """
 
     def __init__(
@@ -109,42 +127,37 @@ class Trainer:
         model_name: str | None = None,
         config: TrainingConfig | None = None,
         model: torch.nn.Module | None = None,
-        tokenizer: object | None = None,
-        pooling: str = "cls",
+        encode_fn: Callable[[list[str]], torch.Tensor] | None = None,
         adapter_path: str | None = None,
     ):
         self.model_name = model_name or "custom"
         self.config = config or TrainingConfig()
         self.device = get_device()
 
-        if model is not None:
-            # Custom model path
-            if tokenizer is None:
-                raise ValueError("Must provide tokenizer when passing a custom model.")
-            self.tokenizer = tokenizer
-            self.pooling_mode = pooling
-            base_model = model.to(self.device)
-        elif model_name is not None:
-            # HuggingFace model path
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            load_kwargs = {}
-            torch_dtype = _resolve_dtype(self.config.dtype)
-            if torch_dtype is not None:
-                load_kwargs["torch_dtype"] = torch_dtype
-            base_model = AutoModel.from_pretrained(model_name, **load_kwargs).to(self.device)
-            self.pooling_mode = _detect_pooling(model_name)
-        else:
-            raise ValueError("Provide either model_name or model.")
+        if model is not None and encode_fn is not None:
+            # Custom model + encode function
+            self.model = model.to(self.device)
+            self._encode_fn = encode_fn
 
-        # Apply LoRA (skip if lora config is None)
+        elif model_name is not None:
+            # HuggingFace convenience path
+            self._load_hf_model(model_name)
+
+        else:
+            raise ValueError(
+                "Provide either model_name or (model + encode_fn)."
+            )
+
+        # Apply LoRA
         if self.config.lora is not None:
             if adapter_path is not None:
-                # Warm-start from a previously trained adapter
                 self.model = PeftModel.from_pretrained(
-                    base_model, adapter_path, is_trainable=True
+                    self.model, adapter_path, is_trainable=True
                 )
                 trainable = sum(
-                    p.numel() for p in self.model.parameters() if p.requires_grad
+                    p.numel()
+                    for p in self.model.parameters()
+                    if p.requires_grad
                 )
                 total = sum(p.numel() for p in self.model.parameters())
                 print(
@@ -153,9 +166,7 @@ class Trainer:
                     f"({100 * trainable / total:.2f}%)"
                 )
             else:
-                self.model = apply_lora(base_model, self.config.lora)
-        else:
-            self.model = base_model
+                self.model = apply_lora(self.model, self.config.lora)
 
         # Mixed precision setup
         self.amp_dtype = None
@@ -163,52 +174,115 @@ class Trainer:
         if self.config.mixed_precision is not None:
             if self.config.mixed_precision == "fp16":
                 self.amp_dtype = torch.float16
-                # GradScaler only needed for fp16, not bf16
-                self.scaler = torch.amp.GradScaler(device=self.device.type)
+                self.scaler = torch.amp.GradScaler(
+                    device=self.device.type
+                )
             elif self.config.mixed_precision == "bf16":
                 self.amp_dtype = torch.bfloat16
             else:
                 raise ValueError(
-                    f"Unknown mixed_precision: {self.config.mixed_precision}. "
+                    f"Unknown mixed_precision: "
+                    f"{self.config.mixed_precision}. "
                     "Use 'fp16', 'bf16', or null."
                 )
 
-        effective_bs = self.config.batch_size * self.config.grad_accum_steps
-        amp_str = f" | AMP: {self.config.mixed_precision}" if self.config.mixed_precision else ""
-        print(f"Effective batch size: {effective_bs} "
-              f"(micro={self.config.batch_size} x accum={self.config.grad_accum_steps})"
-              f"{amp_str}")
+        effective_bs = (
+            self.config.batch_size * self.config.grad_accum_steps
+        )
+        amp_str = (
+            f" | AMP: {self.config.mixed_precision}"
+            if self.config.mixed_precision
+            else ""
+        )
+        print(
+            f"Effective batch size: {effective_bs} "
+            f"(micro={self.config.batch_size} "
+            f"x accum={self.config.grad_accum_steps}){amp_str}"
+        )
+
+    def _load_hf_model(self, model_name: str) -> None:
+        """Load HuggingFace model and wire up encode function."""
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        load_kwargs = {}
+        torch_dtype = _resolve_dtype(self.config.dtype)
+        if torch_dtype is not None:
+            load_kwargs["torch_dtype"] = torch_dtype
+        base_model = AutoModel.from_pretrained(
+            model_name, **load_kwargs
+        ).to(self.device)
+        pooling_mode = _detect_pooling(model_name)
+
+        self.model = base_model
+        # Expose for save (tokenizer needed for save_pretrained)
+        self._tokenizer = tokenizer
+
+        # Build encode function via closure
+        device = self.device
+        max_length = self.config.max_length
+
+        def _encode(texts: list[str]) -> torch.Tensor:
+            encoded = tokenizer(
+                list(texts), padding=True, truncation=True,
+                max_length=max_length, return_tensors="pt",
+            ).to(device)
+            outputs = self.model(**encoded)
+            return _pool(
+                outputs.last_hidden_state,
+                encoded["attention_mask"],
+                pooling_mode,
+            )
+
+        self._encode_fn = _encode
+
+    def _encode_batch(self, texts: list[str] | tuple[str, ...]) -> torch.Tensor:
+        """Encode a batch and L2-normalize. Used during training."""
+        embeddings = self._encode_fn(list(texts))
+        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
     def train(self, dataset: TripletDataset) -> TrainHistory:
         """Run the training loop.
 
         Args:
-            dataset: TripletDataset of (query, positive, negative) triplets.
+            dataset: TripletDataset of (query, positive, negative).
 
         Returns:
-            TrainHistory with per-step loss, lr, grad norm, and per-epoch loss.
+            TrainHistory with per-step loss, lr, grad norm, epoch loss.
         """
         history = TrainHistory()
 
-        # Overfit mode: take only N batches and replay them every epoch
+        # Overfit mode
         overfit_samples = None
         if self.config.overfit_batches is not None:
             n = self.config.overfit_batches
-            subset = [dataset[i] for i in range(min(n * self.config.batch_size, len(dataset)))]
+            subset = [
+                dataset[i]
+                for i in range(
+                    min(n * self.config.batch_size, len(dataset))
+                )
+            ]
             from khoji.data import Triplet
             dataset = TripletDataset([Triplet(*s) for s in subset])
             overfit_samples = subset
-            print(f"\n[OVERFIT MODE] Training on {len(dataset)} samples for {self.config.epochs} epochs")
+            print(
+                f"\n[OVERFIT MODE] Training on {len(dataset)} samples "
+                f"for {self.config.epochs} epochs"
+            )
             self._overfit_report("BEFORE training", overfit_samples)
         else:
-            print(f"\nTraining on {len(dataset)} triplets for {self.config.epochs} epochs")
-            # Sanity check: sample N triplets and report before/after training
+            print(
+                f"\nTraining on {len(dataset)} triplets "
+                f"for {self.config.epochs} epochs"
+            )
             if self.config.sanity_check_samples > 0:
                 import random
-                n = min(self.config.sanity_check_samples, len(dataset))
+                n = min(
+                    self.config.sanity_check_samples, len(dataset)
+                )
                 indices = random.sample(range(len(dataset)), n)
                 overfit_samples = [dataset[i] for i in indices]
-                self._overfit_report("BEFORE training", overfit_samples)
+                self._overfit_report(
+                    "BEFORE training", overfit_samples
+                )
 
         dataloader = DataLoader(
             dataset,
@@ -217,20 +291,26 @@ class Trainer:
         )
 
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
+            filter(
+                lambda p: p.requires_grad, self.model.parameters()
+            ),
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
 
-        # Total optimizer steps (accounting for gradient accumulation)
-        steps_per_epoch = (len(dataloader) + self.config.grad_accum_steps - 1) // self.config.grad_accum_steps
+        steps_per_epoch = (
+            (len(dataloader) + self.config.grad_accum_steps - 1)
+            // self.config.grad_accum_steps
+        )
         total_opt_steps = steps_per_epoch * self.config.epochs
         total_batches = len(dataloader) * self.config.epochs
         scheduler = self._build_scheduler(optimizer, total_opt_steps)
 
-        print(f"Total batches: {total_batches} | "
-              f"Optimizer steps: {total_opt_steps} | "
-              f"Grad clipping: {self.config.max_grad_norm}\n")
+        print(
+            f"Total batches: {total_batches} | "
+            f"Optimizer steps: {total_opt_steps} | "
+            f"Grad clipping: {self.config.max_grad_norm}\n"
+        )
 
         self.model.train()
         global_batch = 0
@@ -244,19 +324,27 @@ class Trainer:
             epoch_batches = 0
             optimizer.zero_grad()
 
-            for batch_idx, (queries, positives, negatives) in enumerate(dataloader):
-                # Encode all three (with optional AMP)
+            for batch_idx, (queries, positives, negatives) in enumerate(
+                dataloader
+            ):
                 if self.amp_dtype is not None:
-                    with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    with torch.amp.autocast(
+                        device_type=self.device.type,
+                        dtype=self.amp_dtype,
+                    ):
                         query_emb = self._encode_batch(queries)
                         pos_emb = self._encode_batch(positives)
                         neg_emb = self._encode_batch(negatives)
-                        loss = self.config.loss_fn(query_emb, pos_emb, neg_emb)
+                        loss = self.config.loss_fn(
+                            query_emb, pos_emb, neg_emb
+                        )
                 else:
                     query_emb = self._encode_batch(queries)
                     pos_emb = self._encode_batch(positives)
                     neg_emb = self._encode_batch(negatives)
-                    loss = self.config.loss_fn(query_emb, pos_emb, neg_emb)
+                    loss = self.config.loss_fn(
+                        query_emb, pos_emb, neg_emb
+                    )
 
                 scaled_loss = loss / self.config.grad_accum_steps
 
@@ -271,16 +359,15 @@ class Trainer:
                 epoch_batches += 1
                 global_batch += 1
 
-                # Step optimizer every grad_accum_steps or at end of epoch
-                is_accum_step = (batch_idx + 1) % self.config.grad_accum_steps == 0
+                is_accum_step = (
+                    (batch_idx + 1) % self.config.grad_accum_steps == 0
+                )
                 is_last_batch = (batch_idx + 1) == len(dataloader)
 
                 if is_accum_step or is_last_batch:
                     if self.scaler is not None:
-                        # fp16: unscale before clipping, then step via scaler
                         self.scaler.unscale_(optimizer)
 
-                    # Gradient clipping
                     grad_norm = 0.0
                     if self.config.max_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -288,7 +375,6 @@ class Trainer:
                             self.config.max_grad_norm,
                         ).item()
                     else:
-                        # Still compute grad norm for logging
                         grad_norm = self._compute_grad_norm()
 
                     if self.scaler is not None:
@@ -301,8 +387,9 @@ class Trainer:
                     optimizer.zero_grad()
                     global_opt_step += 1
 
-                    # Log per optimizer step
-                    n_accum = (batch_idx % self.config.grad_accum_steps) + 1
+                    n_accum = (
+                        batch_idx % self.config.grad_accum_steps
+                    ) + 1
                     step_loss = accum_loss / n_accum
                     step_lr = scheduler.get_last_lr()[0]
 
@@ -312,13 +399,15 @@ class Trainer:
 
                     accum_loss = 0.0
 
-                    # Checkpoint saving
-                    if (self.config.save_every_n_steps is not None
-                            and self.config.save_dir is not None
-                            and global_opt_step % self.config.save_every_n_steps == 0):
+                    if (
+                        self.config.save_every_n_steps is not None
+                        and self.config.save_dir is not None
+                        and global_opt_step
+                        % self.config.save_every_n_steps
+                        == 0
+                    ):
                         self._save_checkpoint(global_opt_step)
 
-                # Update progress bar
                 pbar.update(1)
                 pbar.set_postfix(
                     epoch=f"{epoch+1}/{self.config.epochs}",
@@ -328,16 +417,16 @@ class Trainer:
 
             epoch_avg = epoch_loss / max(epoch_batches, 1)
             history.epoch_loss.append(epoch_avg)
-            tqdm.write(f"  Epoch {epoch+1}/{self.config.epochs} complete | "
-                       f"Avg Loss: {epoch_avg:.4f}")
+            tqdm.write(
+                f"  Epoch {epoch+1}/{self.config.epochs} complete | "
+                f"Avg Loss: {epoch_avg:.4f}"
+            )
 
         pbar.close()
 
-        # Show after-training metrics (both overfit and sanity check modes)
         if overfit_samples is not None:
             self._overfit_report("AFTER training", overfit_samples)
 
-        # Save if requested
         if self.config.save_dir:
             self.save(self.config.save_dir)
 
@@ -348,8 +437,12 @@ class Trainer:
         save_path = Path(path)
         save_path.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        label = "LoRA adapter" if self.config.lora is not None else "Full model"
+        if hasattr(self, "_tokenizer") and self._tokenizer is not None:
+            self._tokenizer.save_pretrained(save_path)
+        label = (
+            "LoRA adapter" if self.config.lora is not None
+            else "Full model"
+        )
         print(f"{label} saved to {save_path}")
 
     def _save_checkpoint(self, step: int) -> None:
@@ -359,16 +452,18 @@ class Trainer:
             ckpt_dir = base / f"checkpoint-{step}"
         else:
             ckpt_dir = base / "checkpoint-latest"
-            # Remove old checkpoint before saving new one
             if ckpt_dir.exists():
                 shutil.rmtree(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(ckpt_dir)
-        self.tokenizer.save_pretrained(ckpt_dir)
+        if hasattr(self, "_tokenizer") and self._tokenizer is not None:
+            self._tokenizer.save_pretrained(ckpt_dir)
         tqdm.write(f"  Checkpoint saved to {ckpt_dir}")
 
     @torch.no_grad()
-    def _overfit_report(self, label: str, samples: list[tuple[str, str, str]]) -> None:
+    def _overfit_report(
+        self, label: str, samples: list[tuple[str, str, str]]
+    ) -> None:
         """Print similarity metrics for overfit samples."""
         self.model.eval()
 
@@ -384,41 +479,42 @@ class Trainer:
         neg_sim = torch.nn.functional.cosine_similarity(q_emb, n_emb)
         margin = pos_sim - neg_sim
 
-        print(f"\n  [{label}] Overfit metrics ({len(samples)} samples):")
-        print(f"    Avg cos_sim(query, positive):  {pos_sim.mean().item():.4f}")
-        print(f"    Avg cos_sim(query, negative):  {neg_sim.mean().item():.4f}")
-        print(f"    Avg margin (pos - neg):        {margin.mean().item():.4f}")
-        print(f"    Samples where pos > neg:       {(margin > 0).sum().item()}/{len(samples)}")
+        print(
+            f"\n  [{label}] Overfit metrics ({len(samples)} samples):"
+        )
+        print(
+            f"    Avg cos_sim(query, positive):  "
+            f"{pos_sim.mean().item():.4f}"
+        )
+        print(
+            f"    Avg cos_sim(query, negative):  "
+            f"{neg_sim.mean().item():.4f}"
+        )
+        print(
+            f"    Avg margin (pos - neg):        "
+            f"{margin.mean().item():.4f}"
+        )
+        print(
+            f"    Samples where pos > neg:       "
+            f"{(margin > 0).sum().item()}/{len(samples)}"
+        )
 
-        # Per-sample details if small enough
         if len(samples) <= 10:
-            print(f"    {'Sample':<8} {'pos_sim':>8} {'neg_sim':>8} {'margin':>8} {'correct':>8}")
+            print(
+                f"    {'Sample':<8} {'pos_sim':>8} {'neg_sim':>8} "
+                f"{'margin':>8} {'correct':>8}"
+            )
             print(f"    {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
             for i in range(len(samples)):
                 correct = "yes" if margin[i].item() > 0 else "NO"
-                print(f"    {i:<8} {pos_sim[i].item():>8.4f} {neg_sim[i].item():>8.4f} "
-                      f"{margin[i].item():>8.4f} {correct:>8}")
+                print(
+                    f"    {i:<8} {pos_sim[i].item():>8.4f} "
+                    f"{neg_sim[i].item():>8.4f} "
+                    f"{margin[i].item():>8.4f} {correct:>8}"
+                )
         print()
 
         self.model.train()
-
-    def _encode_batch(self, texts: list[str] | tuple[str, ...]) -> torch.Tensor:
-        """Tokenize and encode a batch of texts, returning L2-normalized embeddings."""
-        encoded = self.tokenizer(
-            list(texts),
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
-            return_tensors="pt",
-        ).to(self.device)
-
-        outputs = self.model(**encoded)
-        embeddings = _pool(
-            outputs.last_hidden_state,
-            encoded["attention_mask"],
-            self.pooling_mode,
-        )
-        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
     def _compute_grad_norm(self) -> float:
         """Compute total gradient norm across all parameters."""

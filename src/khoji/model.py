@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Callable
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -22,9 +23,15 @@ def _resolve_dtype(dtype: str | None) -> torch.dtype | None:
     """
     if dtype is None:
         return None
-    mapping = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    mapping = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
     if dtype not in mapping:
-        raise ValueError(f"Unknown dtype: {dtype!r}. Use 'fp16', 'bf16', or null.")
+        raise ValueError(
+            f"Unknown dtype: {dtype!r}. Use 'fp16', 'bf16', or null."
+        )
     return mapping[dtype]
 
 
@@ -75,127 +82,169 @@ def _pool(
         return last_hidden_state[:, 0, :]
 
     if mode == "lasttoken":
-        # Index of last non-padding token per sequence
-        seq_lengths = attention_mask.sum(dim=1) - 1  # (batch,)
-        batch_indices = torch.arange(last_hidden_state.size(0), device=last_hidden_state.device)
+        seq_lengths = attention_mask.sum(dim=1) - 1
+        batch_indices = torch.arange(
+            last_hidden_state.size(0), device=last_hidden_state.device
+        )
         return last_hidden_state[batch_indices, seq_lengths, :]
 
-    # For mean variants, mask out padding tokens
-    mask = attention_mask.unsqueeze(-1).float()  # (batch, seq_len, 1)
+    mask = attention_mask.unsqueeze(-1).float()
     masked = last_hidden_state * mask
 
     if mode == "mean":
         return masked.sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
     if mode == "mean_sqrt_len":
-        return masked.sum(dim=1) / torch.sqrt(mask.sum(dim=1).clamp(min=1e-9))
+        return masked.sum(dim=1) / torch.sqrt(
+            mask.sum(dim=1).clamp(min=1e-9)
+        )
 
     if mode == "weightedmean":
-        # Weights: position index (1-indexed), higher weight for later tokens
         seq_len = last_hidden_state.size(1)
-        weights = torch.arange(1, seq_len + 1, dtype=torch.float, device=last_hidden_state.device)
-        weights = weights.unsqueeze(0).unsqueeze(-1) * mask  # (batch, seq_len, 1)
-        return (last_hidden_state * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1e-9)
+        weights = torch.arange(
+            1, seq_len + 1,
+            dtype=torch.float, device=last_hidden_state.device,
+        )
+        weights = weights.unsqueeze(0).unsqueeze(-1) * mask
+        return (
+            (last_hidden_state * weights).sum(dim=1)
+            / weights.sum(dim=1).clamp(min=1e-9)
+        )
 
     if mode == "max":
-        masked = last_hidden_state.masked_fill(~attention_mask.unsqueeze(-1).bool(), -1e9)
+        masked = last_hidden_state.masked_fill(
+            ~attention_mask.unsqueeze(-1).bool(), -1e9
+        )
         return masked.max(dim=1).values
 
     raise ValueError(f"Unknown pooling mode: {mode}")
 
 
 class EmbeddingModel:
-    """Wraps a transformer model for producing embeddings.
+    """Wraps a text encoder for producing embeddings.
 
-    Can load from HuggingFace by name, or accept a pre-built model and tokenizer
-    for custom architectures.
+    **HuggingFace models** (auto-detects pooling, tokenizer):
+
+        model = EmbeddingModel("BAAI/bge-base-en-v1.5")
+        embeddings = model.encode(["What is compound interest?"])
+
+    **Custom encoder** — provide your own encode function:
+
+        model = EmbeddingModel(
+            encoder=my_encode_fn,  # (texts: list[str]) -> Tensor
+        )
+
+    The encoder function receives a batch of texts and returns a tensor
+    of shape ``(batch, embed_dim)``. The library handles batching,
+    L2 normalization, and device transfer.
+
+    Args:
+        model_name: HuggingFace model name. Auto-detects pooling,
+            loads tokenizer and model weights.
+        adapter_path: Path to a saved LoRA adapter directory.
+        encoder: Custom encoding function. Signature:
+            ``(texts: list[str]) -> Tensor``. Returns raw embeddings
+            (library normalizes). Takes priority over model_name.
+        device: Device to load the model on. None = auto-detect.
+        max_length: Maximum token length for tokenization.
+        dtype: Load base model weights in "fp16", "bf16", or None.
     """
 
     def __init__(
         self,
         model_name: str | None = None,
         adapter_path: str | None = None,
+        encoder: Callable[[list[str]], torch.Tensor] | None = None,
         device: torch.device | None = None,
-        model: torch.nn.Module | None = None,
-        tokenizer: object | None = None,
-        pooling: str = "cls",
         max_length: int = 512,
         dtype: str | None = None,
     ):
-        """Load an embedding model, optionally with a LoRA adapter.
-
-        **HuggingFace models** — pass ``model_name``:
-
-            EmbeddingModel("BAAI/bge-base-en-v1.5")
-
-        **Custom PyTorch models** — pass ``model``, ``tokenizer``, and ``pooling``:
-
-            EmbeddingModel(
-                model=my_encoder,
-                tokenizer=my_tokenizer,
-                pooling="mean",
-            )
-
-        Args:
-            model_name: HuggingFace model name. Ignored if ``model`` is provided.
-            adapter_path: Path to a saved LoRA adapter directory.
-            device: Device to load the model on. None = auto-detect.
-            model: A pre-built PyTorch model. Must return an object with
-                ``last_hidden_state`` when called with tokenizer outputs.
-            tokenizer: A tokenizer compatible with the model. Must support
-                ``(texts, padding=True, truncation=True, return_tensors="pt")``.
-            pooling: Pooling strategy when using a custom model. One of:
-                "cls", "mean", "max", "mean_sqrt_len", "weightedmean", "lasttoken".
-                Ignored for HuggingFace models (auto-detected).
-            max_length: Maximum token length for tokenization. Default: 512.
-            dtype: Load base model weights in this precision. One of:
-                ``"fp16"``, ``"bf16"``, or ``None`` (fp32, default).
-                Reduces memory usage — LoRA weights are always kept in fp32.
-        """
         self.device = device or get_device()
-
         self.max_length = max_length
         self._torch_dtype = _resolve_dtype(dtype)
 
-        if model is not None:
-            # Custom model path
-            if tokenizer is None:
-                raise ValueError("Must provide tokenizer when passing a custom model.")
-            self.model = model.to(self.device)
-            self.tokenizer = tokenizer
-            self.pooling_mode = pooling
-            self.model.eval()
-            dtype_str = f" | dtype: {dtype}" if dtype else ""
-            print(f"Loaded custom model | pooling: {self.pooling_mode} | device: {self.device}{dtype_str}")
+        if encoder is not None:
+            # Custom encoder path
+            self._encoder_fn = encoder
+            self.model = None
+            self.tokenizer = None
+            self.pooling_mode = None
+            print(f"Loaded custom encoder | device: {self.device}")
+
         elif model_name is not None:
             # HuggingFace model path
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            load_kwargs = {}
-            if self._torch_dtype is not None:
-                load_kwargs["torch_dtype"] = self._torch_dtype
-            self.model = AutoModel.from_pretrained(model_name, **load_kwargs).to(self.device)
-            self.pooling_mode = _detect_pooling(model_name)
+            self._load_hf_model(model_name, adapter_path, dtype)
 
-            if adapter_path is not None:
-                from peft import PeftModel
-
-                self.model = PeftModel.from_pretrained(self.model, adapter_path).to(self.device)
-                self.model.eval()
-                dtype_str = f" | dtype: {dtype}" if dtype else ""
-                print(f"Loaded {model_name} + adapter from {adapter_path} | "
-                      f"pooling: {self.pooling_mode} | device: {self.device}{dtype_str}")
-            else:
-                self.model.eval()
-                dtype_str = f" | dtype: {dtype}" if dtype else ""
-                print(f"Loaded {model_name} | pooling: {self.pooling_mode} | device: {self.device}{dtype_str}")
         else:
-            raise ValueError("Provide either model_name or model.")
+            raise ValueError(
+                "Provide either model_name or encoder."
+            )
+
+    def _load_hf_model(
+        self,
+        model_name: str,
+        adapter_path: str | None,
+        dtype: str | None,
+    ) -> None:
+        """Load HuggingFace model and wire up encoder function."""
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        load_kwargs = {}
+        if self._torch_dtype is not None:
+            load_kwargs["torch_dtype"] = self._torch_dtype
+        model = AutoModel.from_pretrained(
+            model_name, **load_kwargs
+        ).to(self.device)
+        pooling_mode = _detect_pooling(model_name)
+
+        if adapter_path is not None:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(
+                model, adapter_path
+            ).to(self.device)
+
+        model.eval()
+
+        # Expose for trainer (needs direct model access for gradients)
+        self.model = model
+        self.tokenizer = tokenizer
+        self.pooling_mode = pooling_mode
+
+        # Build encoder function via closure
+        device = self.device
+        max_length = self.max_length
+
+        def _encode(texts: list[str]) -> torch.Tensor:
+            encoded = tokenizer(
+                texts, padding=True, truncation=True,
+                max_length=max_length, return_tensors="pt",
+            ).to(device)
+            outputs = model(**encoded)
+            return _pool(
+                outputs.last_hidden_state,
+                encoded["attention_mask"],
+                pooling_mode,
+            )
+
+        self._encoder_fn = _encode
+
+        dtype_str = f" | dtype: {dtype}" if dtype else ""
+        adapter_str = (
+            f" + adapter from {adapter_path}" if adapter_path else ""
+        )
+        print(
+            f"Loaded {model_name}{adapter_str} | "
+            f"pooling: {pooling_mode} | "
+            f"device: {self.device}{dtype_str}"
+        )
 
     @torch.no_grad()
     def encode(
-        self, texts: list[str], batch_size: int = 64, show_progress: bool = True
+        self,
+        texts: list[str],
+        batch_size: int = 64,
+        show_progress: bool = True,
     ) -> torch.Tensor:
-        """Encode a list of texts into embeddings.
+        """Encode a list of texts into L2-normalized embeddings.
 
         Args:
             texts: List of strings to encode.
@@ -203,34 +252,21 @@ class EmbeddingModel:
             show_progress: Whether to show a progress bar.
 
         Returns:
-            Tensor of shape (len(texts), hidden_dim), L2-normalized.
+            Tensor of shape (len(texts), embed_dim), L2-normalized.
         """
         all_embeddings = []
 
         iterator = range(0, len(texts), batch_size)
         if show_progress:
             from tqdm import tqdm
-
             iterator = tqdm(iterator, desc="Encoding", unit="batch")
 
         for start in iterator:
-            batch_texts = texts[start : start + batch_size]
-            encoded = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-            ).to(self.device)
-
-            outputs = self.model(**encoded)
-            embeddings = _pool(
-                outputs.last_hidden_state,
-                encoded["attention_mask"],
-                self.pooling_mode,
+            batch_texts = texts[start: start + batch_size]
+            embeddings = self._encoder_fn(batch_texts)
+            embeddings = torch.nn.functional.normalize(
+                embeddings, p=2, dim=1
             )
-            # L2 normalize
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
             all_embeddings.append(embeddings.cpu())
 
         return torch.cat(all_embeddings, dim=0)

@@ -1,0 +1,24 @@
+{
+  "model_name": "BAAI/bge-base-en-v1.5",
+  "dataset_name": "fiqa",
+  "split": "test",
+  "num_queries": 648,
+  "num_corpus": 57638,
+  "k_values": [
+    1,
+    5,
+    10
+  ],
+  "metrics": {
+    "ndcg@1": 0.3873,
+    "mrr@1": 0.3873,
+    "recall@1": 0.1929,
+    "ndcg@5": 0.362,
+    "mrr@5": 0.463,
+    "recall@5": 0.3728,
+    "ndcg@10": 0.3909,
+    "mrr@10": 0.474,
+    "recall@10": 0.4572
+  },
+  "timestamp": "2026-03-21T22:37:34.873338+00:00"
+}

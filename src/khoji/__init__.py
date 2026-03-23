@@ -1,6 +1,6 @@
 """khoji: Fine-tune embedding models for domain-specific retrieval."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from khoji.config import ForgeConfig
 from khoji.data import (
@@ -30,10 +30,24 @@ from khoji.multimodal_data import (
 )
 from khoji.multimodal_dataset import MultimodalRetrievalDataset, load_flickr30k, load_rsicd, load_custom_multimodal
 from khoji.multimodal_evaluator import MultimodalEvaluator
-from khoji.multimodal_model import MultimodalEmbeddingModel
+from khoji.multimodal_model import JointEmbeddingModel, MultimodalEmbeddingModel
 from khoji.multimodal_run import run_multimodal
 from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
 from khoji.image_utils import load_image, load_images_batch
+
+# Composed (image+text → image)
+from khoji.composed_config import ComposedForgeConfig
+from khoji.composed_data import (
+    ComposedTriplet,
+    ComposedTripletDataset,
+    build_mixed_negatives_composed,
+    build_random_negatives_composed,
+    mine_hard_negatives_composed,
+)
+from khoji.composed_dataset import ComposedRetrievalDataset, load_custom_composed
+from khoji.composed_evaluator import ComposedEvaluator
+from khoji.composed_run import run_composed
+from khoji.composed_trainer import ComposedTrainer, ComposedTrainingConfig
 
 __all__ = [
     # Text-text
@@ -62,6 +76,7 @@ __all__ = [
     "run",
     "triplet_margin_loss",
     # Multimodal (text-to-image)
+    "JointEmbeddingModel",
     "MultimodalEmbeddingModel",
     "MultimodalEvaluator",
     "MultimodalForgeConfig",
@@ -79,4 +94,17 @@ __all__ = [
     "load_images_batch",
     "mine_hard_negatives_multimodal",
     "run_multimodal",
+    # Composed (image+text → image)
+    "ComposedEvaluator",
+    "ComposedForgeConfig",
+    "ComposedRetrievalDataset",
+    "ComposedTrainer",
+    "ComposedTrainingConfig",
+    "ComposedTriplet",
+    "ComposedTripletDataset",
+    "build_mixed_negatives_composed",
+    "build_random_negatives_composed",
+    "load_custom_composed",
+    "mine_hard_negatives_composed",
+    "run_composed",
 ]

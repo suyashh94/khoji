@@ -241,7 +241,7 @@ class TestMultimodalTrainer:
         trainer = MultimodalTrainer("openai/clip-vit-base-patch32", config)
         # Check that text model LoRA params are frozen
         text_lora_params = [
-            p for n, p in trainer._full_model.named_parameters()
+            p for n, p in trainer.model.named_parameters()
             if "text_model" in n and "lora" in n
         ]
         assert all(not p.requires_grad for p in text_lora_params)

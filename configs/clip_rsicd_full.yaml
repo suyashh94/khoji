@@ -1,5 +1,6 @@
-# Mixed negatives config for Flickr30k
-# Usage: khoji multimodal flickr30k_mixed.yaml
+# Text-to-image retrieval: CLIP ViT-B/32 on RSICD (satellite imagery)
+# CLIP wasn't trained on satellite images — fine-tuning shows clear gains
+# Usage: khoji multimodal configs/clip_rsicd_full.yaml
 model:
   name: openai/clip-vit-base-patch32
   adapter_path: null
@@ -7,9 +8,10 @@ model:
   lora_target: both
 
 data:
-  dataset: nlphuji/flickr30k
+  dataset: arampacha/rsicd
   split: train
   negatives: mixed
+  n_negatives: 3
   n_random: 2
   n_hard: 1
   n_queries: null
@@ -27,8 +29,8 @@ lora:
 
 train:
   epochs: 3
-  batch_size: 32
-  grad_accum_steps: 1
+  batch_size: 16
+  grad_accum_steps: 2
   lr: 2e-5
   weight_decay: 0.01
   warmup_steps: 100
@@ -37,7 +39,7 @@ train:
   loss: infonce
   margin: 0.2
   temperature: 0.05
-  mixed_precision: bf16
+  mixed_precision: null
   overfit_batches: null
   sanity_check_samples: 10
   save_every_n_steps: null
@@ -54,4 +56,4 @@ eval:
   run_before: true
   run_after: true
 
-output_dir: ./forge-output/flickr30k-mixed
+output_dir: ./forge-output/clip-rsicd-full
