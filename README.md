@@ -2,9 +2,14 @@
 
 **Make retrieval models actually work on your data**
 
-[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture) | [Tutorial](output/webpage/index.html)
+[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture) | [Tutorial](#interactive-tutorial)
 
-> **Interactive Tutorial:** See the [full walkthrough with examples](output/webpage/index.html) — covers all four retrieval modes with real before/after results, code you can copy, and embedded retrieval visualizations.
+> **Interactive Tutorial:** A comprehensive walkthrough with before/after retrieval examples, complete code, and visualizations for all four modes. Generate it locally:
+> ```bash
+> python scripts/collect_webpage_data.py   # collect retrieval examples (requires trained adapters)
+> python scripts/generate_khoji_webpage.py  # generate output/webpage/index.html
+> ```
+> Or run the training scripts first to produce the adapters, then generate the tutorial page.
 
 ---
 
