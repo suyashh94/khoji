@@ -1,4 +1,4 @@
-"""Evaluator for composed (image+text → image) retrieval."""
+"""Evaluator for composed retrieval (mixed-mode)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def _build_test_corpus_composed(
     dataset: ComposedRetrievalDataset,
     query_ids: list[str],
     corpus_size: int,
-) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
+) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, int]]]:
     """Build a smaller gallery for testing mode.
 
     Includes all relevant images for the selected queries, then fills
@@ -45,10 +45,11 @@ def _build_test_corpus_composed(
 
 
 class ComposedEvaluator:
-    """Evaluate a joint model on composed (image+text → image) retrieval.
+    """Evaluate a joint model on mixed-mode retrieval.
 
-    Queries are (reference_image, modification_text) pairs encoded jointly.
-    The gallery is encoded as image-only embeddings.
+    Queries and corpus items can each be image-only, text-only, or
+    image+text. Encoding mode is dispatched per item based on which
+    modalities are present.
 
     **HuggingFace BLIP-2:**
 
@@ -86,6 +87,66 @@ class ComposedEvaluator:
         else:
             raise ValueError("Provide either model_name or embedding_model.")
         self.adapter_path = adapter_path
+
+    def _encode_items(
+        self,
+        items: dict[str, tuple[str, str]],
+        base_dir: str | None,
+        cache_dir: str | None,
+        batch_size: int,
+        label: str = "items",
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Encode mixed-mode items by grouping them by modality for efficient batching.
+
+        Returns (embeddings, valid_ids) with failed items skipped.
+        """
+        # Load images and classify items by mode
+        img_only_ids, img_only_imgs = [], []
+        txt_only_ids, txt_only_txts = [], []
+        joint_ids, joint_imgs, joint_txts = [], [], []
+
+        for item_id, (img_src, txt) in items.items():
+            img = load_image(img_src, base_dir=base_dir, cache_dir=cache_dir) if img_src != "" else None
+            if img_src != "" and img is None:
+                continue  # failed to load
+            has_img = img is not None
+            has_txt = txt != ""
+            if has_img and has_txt:
+                joint_ids.append(item_id)
+                joint_imgs.append(img)
+                joint_txts.append(txt)
+            elif has_img:
+                img_only_ids.append(item_id)
+                img_only_imgs.append(img)
+            elif has_txt:
+                txt_only_ids.append(item_id)
+                txt_only_txts.append(txt)
+
+        total = len(img_only_ids) + len(txt_only_ids) + len(joint_ids)
+        print(f"Encoding {total} {label} (img={len(img_only_ids)}, txt={len(txt_only_ids)}, joint={len(joint_ids)})...")
+
+        all_embs = []
+        all_ids = []
+
+        if img_only_imgs:
+            emb = self.model.encode(images=img_only_imgs, batch_size=batch_size)
+            all_embs.append(emb)
+            all_ids.extend(img_only_ids)
+
+        if txt_only_txts:
+            emb = self.model.encode(texts=txt_only_txts, batch_size=batch_size)
+            all_embs.append(emb)
+            all_ids.extend(txt_only_ids)
+
+        if joint_imgs:
+            emb = self.model.encode(images=joint_imgs, texts=joint_txts, batch_size=batch_size)
+            all_embs.append(emb)
+            all_ids.extend(joint_ids)
+
+        if not all_embs:
+            return torch.empty(0), []
+
+        return torch.cat(all_embs, dim=0), all_ids
 
     def evaluate(
         self,
@@ -140,38 +201,22 @@ class ComposedEvaluator:
             qrels = dataset.qrels
 
         corpus_ids = list(corpus.keys())
-        corpus_sources = list(corpus.values())
 
-        # Encode gallery images
-        print(f"Encoding {len(corpus_sources)} gallery images...")
-        gallery_images = []
-        valid_corpus_ids = []
-        for cid, src in zip(corpus_ids, corpus_sources):
-            img = load_image(src, base_dir=dataset.base_dir, cache_dir=cache_dir)
-            if img is not None:
-                gallery_images.append(img)
-                valid_corpus_ids.append(cid)
-
-        gallery_embeddings = self.model.encode(
-            images=gallery_images, batch_size=batch_size
+        # Encode corpus items — group by mode for efficient batching
+        gallery_embeddings, valid_corpus_ids = self._encode_items(
+            {cid: corpus[cid] for cid in corpus_ids},
+            base_dir=dataset.base_dir, cache_dir=cache_dir,
+            batch_size=batch_size, label="corpus",
         )
 
-        # Encode composed queries (image + text)
-        print(f"Encoding {len(query_ids)} composed queries...")
-        query_embeddings_list = []
-        valid_query_ids = []
-        for qid in query_ids:
-            img_src, text = dataset.queries[qid]
-            q_img = load_image(img_src, base_dir=dataset.base_dir, cache_dir=cache_dir)
-            if q_img is None:
-                continue
-            q_emb = self.model.encode(
-                images=[q_img], texts=[text], show_progress=False
-            )
-            query_embeddings_list.append(q_emb)
-            valid_query_ids.append(qid)
+        # Encode queries — group by mode for efficient batching
+        query_embeddings, valid_query_ids = self._encode_items(
+            {qid: dataset.queries[qid] for qid in query_ids},
+            base_dir=dataset.base_dir, cache_dir=cache_dir,
+            batch_size=batch_size, label="queries",
+        )
 
-        if not query_embeddings_list:
+        if len(valid_query_ids) == 0:
             print("Warning: No valid queries found.")
             return EvalResult(
                 metrics={}, model_name=self.model_name,
@@ -179,8 +224,6 @@ class ComposedEvaluator:
                 num_queries=0, num_corpus=len(valid_corpus_ids),
                 k_values=k_values,
             )
-
-        query_embeddings = torch.cat(query_embeddings_list, dim=0)
 
         # Compute metrics
         max_k = max(k_values)

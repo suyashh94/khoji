@@ -15,7 +15,7 @@ def load_image(
     source: str,
     base_dir: str | None = None,
     cache_dir: str | None = None,
-) -> Image.Image:
+) -> Image.Image | None:
     """Load a single image from a local path or URL.
 
     Args:
@@ -24,13 +24,16 @@ def load_image(
         cache_dir: If set, downloaded URL images are cached here.
 
     Returns:
-        PIL Image in RGB mode.
+        PIL Image in RGB mode, or None if loading fails.
     """
-    if source.startswith("http://") or source.startswith("https://"):
-        return _load_from_url(source, cache_dir)
-    else:
-        path = Path(base_dir) / source if base_dir else Path(source)
-        return Image.open(path).convert("RGB")
+    try:
+        if source.startswith("http://") or source.startswith("https://"):
+            return _load_from_url(source, cache_dir)
+        else:
+            path = Path(base_dir) / source if base_dir else Path(source)
+            return Image.open(path).convert("RGB")
+    except Exception:
+        return None
 
 
 def load_images_batch(

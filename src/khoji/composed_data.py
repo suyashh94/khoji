@@ -1,4 +1,4 @@
-"""Training data preparation for composed (image+text → image) retrieval."""
+"""Training data preparation for composed retrieval (mixed-mode)."""
 
 from __future__ import annotations
 
@@ -13,16 +13,18 @@ from khoji.composed_dataset import ComposedRetrievalDataset
 
 @dataclass
 class ComposedTriplet:
-    """A training triplet for composed retrieval.
+    """A training triplet for mixed-mode retrieval.
 
-    The query is a (reference_image, modification_text) pair.
-    Positive and negative are target image sources.
+    Each of query, positive, and negative can be image-only, text-only,
+    or image+text. Use ``""`` for absent modalities.
     """
 
-    query_image: str  # reference image path/URL
-    query_text: str  # modification caption
-    positive: str  # target image path/URL
-    negative: str  # negative image path/URL
+    query_image: str  # "" if text-only query
+    query_text: str  # "" if image-only query
+    positive_image: str  # "" if text-only target
+    positive_text: str  # "" if image-only target
+    negative_image: str  # "" if text-only target
+    negative_text: str  # "" if image-only target
 
 
 class ComposedTripletDataset(Dataset):
@@ -34,9 +36,13 @@ class ComposedTripletDataset(Dataset):
     def __len__(self) -> int:
         return len(self.triplets)
 
-    def __getitem__(self, idx: int) -> tuple[str, str, str, str]:
+    def __getitem__(self, idx: int) -> tuple[str, str, str, str, str, str]:
         t = self.triplets[idx]
-        return t.query_image, t.query_text, t.positive, t.negative
+        return (
+            t.query_image, t.query_text,
+            t.positive_image, t.positive_text,
+            t.negative_image, t.negative_text,
+        )
 
 
 def _subset_composed_dataset(
@@ -83,10 +89,10 @@ def build_random_negatives_composed(
     n_queries: int | None = None,
     seed: int = 42,
 ) -> list[ComposedTriplet]:
-    """Build composed triplets with random negative images.
+    """Build composed triplets with random negatives.
 
     Args:
-        dataset: ComposedRetrievalDataset with (image, text) queries and image corpus.
+        dataset: ComposedRetrievalDataset with mixed-mode queries and corpus.
         n_negatives: Number of random negatives per (query, positive) pair.
         n_queries: Number of queries to use. None = all.
         seed: Random seed.
@@ -112,21 +118,83 @@ def build_random_negatives_composed(
         for pos_id in relevant_ids:
             if pos_id not in dataset.corpus:
                 continue
-            pos_source = dataset.corpus[pos_id]
+            pos_image, pos_text = dataset.corpus[pos_id]
             neg_sample = rng.sample(non_relevant, min(n_negatives, len(non_relevant)))
             for neg_id in neg_sample:
-                neg_source = dataset.corpus[neg_id]
+                neg_image, neg_text = dataset.corpus[neg_id]
                 triplets.append(
                     ComposedTriplet(
                         query_image=query_image,
                         query_text=query_text,
-                        positive=pos_source,
-                        negative=neg_source,
+                        positive_image=pos_image,
+                        positive_text=pos_text,
+                        negative_image=neg_image,
+                        negative_text=neg_text,
                     )
                 )
 
     print(f"Built {len(triplets)} composed triplets with random negatives")
     return triplets
+
+
+def _encode_mixed_items(model, items, base_dir, cache_dir, batch_size=64):
+    """Encode a dict of mixed-mode items by grouping them by modality.
+
+    Args:
+        model: JointEmbeddingModel.
+        items: dict of id -> (image_source, text). "" = absent.
+        base_dir: Base directory for resolving relative image paths.
+        cache_dir: Image cache directory.
+        batch_size: Batch size for encoding.
+
+    Returns:
+        (embeddings, valid_ids) tuple.
+    """
+    from khoji.image_utils import load_image
+
+    img_only_ids, img_only_imgs = [], []
+    txt_only_ids, txt_only_txts = [], []
+    joint_ids, joint_imgs, joint_txts = [], [], []
+
+    for item_id, (img_src, txt) in items.items():
+        img = load_image(img_src, base_dir=base_dir, cache_dir=cache_dir) if img_src != "" else None
+        if img_src != "" and img is None:
+            continue
+        has_img = img is not None
+        has_txt = txt != ""
+        if has_img and has_txt:
+            joint_ids.append(item_id)
+            joint_imgs.append(img)
+            joint_txts.append(txt)
+        elif has_img:
+            img_only_ids.append(item_id)
+            img_only_imgs.append(img)
+        elif has_txt:
+            txt_only_ids.append(item_id)
+            txt_only_txts.append(txt)
+
+    all_embs = []
+    all_ids = []
+
+    if img_only_imgs:
+        emb = model.encode(images=img_only_imgs, batch_size=batch_size)
+        all_embs.append(emb)
+        all_ids.extend(img_only_ids)
+
+    if txt_only_txts:
+        emb = model.encode(texts=txt_only_txts, batch_size=batch_size)
+        all_embs.append(emb)
+        all_ids.extend(txt_only_ids)
+
+    if joint_imgs:
+        emb = model.encode(images=joint_imgs, texts=joint_txts, batch_size=batch_size)
+        all_embs.append(emb)
+        all_ids.extend(joint_ids)
+
+    if not all_embs:
+        return torch.empty(0), []
+
+    return torch.cat(all_embs, dim=0), all_ids
 
 
 def mine_hard_negatives_composed(
@@ -142,44 +210,44 @@ def mine_hard_negatives_composed(
 ) -> list[ComposedTriplet]:
     """Build composed triplets with hard negatives mined from the model.
 
-    Encodes all gallery images and composed queries (image + text),
-    then finds the most similar non-relevant gallery images as hard negatives.
+    Encodes all corpus items and queries in their respective modes,
+    then finds the most similar non-relevant items as hard negatives.
 
     Args:
         dataset: ComposedRetrievalDataset.
         model: JointEmbeddingModel for encoding.
         n_negatives: Number of hard negatives per (query, positive) pair.
-        top_k: Top-k gallery images to consider for mining.
-        skip_top: Skip top N non-relevant images before picking negatives.
+        top_k: Top-k corpus items to consider for mining.
+        skip_top: Skip top N non-relevant items before picking negatives.
         batch_size: Batch size for encoding.
         n_queries: Number of queries to use. None = all.
-        corpus_size: Gallery size limit. None = all.
+        corpus_size: Corpus size limit. None = all.
         cache_dir: Image cache directory.
 
     Returns:
         List of ComposedTriplet.
     """
-    from khoji.image_utils import load_image
-
     if n_queries is not None or corpus_size is not None:
         dataset = _subset_composed_dataset(dataset, n_queries, corpus_size)
 
-    # Encode gallery images
+    # Encode corpus items (batched by mode)
     corpus_ids = list(dataset.corpus.keys())
-    corpus_sources = list(dataset.corpus.values())
-    print(f"Encoding {len(corpus_sources)} gallery images for negative mining...")
+    print(f"Encoding {len(corpus_ids)} corpus items for negative mining...")
 
-    gallery_images = []
-    valid_corpus_ids = []
-    for cid, src in zip(corpus_ids, corpus_sources):
-        img = load_image(src, base_dir=dataset.base_dir, cache_dir=cache_dir)
-        if img is not None:
-            gallery_images.append(img)
-            valid_corpus_ids.append(cid)
-
-    gallery_embeddings = model.encode(
-        images=gallery_images, batch_size=batch_size
+    gallery_embeddings, valid_corpus_ids = _encode_mixed_items(
+        model, dataset.corpus, dataset.base_dir, cache_dir, batch_size,
     )
+
+    # Encode queries (batched by mode)
+    query_items = {qid: dataset.queries[qid] for qid in dataset.queries if qid in dataset.qrels}
+    print(f"Encoding {len(query_items)} queries for negative mining...")
+
+    query_embeddings, valid_query_ids = _encode_mixed_items(
+        model, query_items, dataset.base_dir, cache_dir, batch_size,
+    )
+
+    # Build id -> embedding index for queries
+    q_emb_idx = {qid: i for i, qid in enumerate(valid_query_ids)}
 
     fetch_k = top_k + skip_top
 
@@ -191,22 +259,12 @@ def mine_hard_negatives_composed(
 
     triplets: list[ComposedTriplet] = []
 
-    query_ids = list(dataset.queries.keys())
-    for qid in query_ids:
-        if qid not in dataset.qrels:
-            continue
-
+    for qid in valid_query_ids:
         query_image_src, query_text = dataset.queries[qid]
         qrel = dataset.qrels[qid]
         relevant_ids = set(qrel.keys())
 
-        # Load query reference image
-        q_img = load_image(query_image_src, base_dir=dataset.base_dir, cache_dir=cache_dir)
-        if q_img is None:
-            continue
-
-        # Encode composed query (image + text)
-        q_emb = model.encode(images=[q_img], texts=[query_text], show_progress=False)
+        q_emb = query_embeddings[q_emb_idx[qid]].unsqueeze(0)
         scores = torch.mm(q_emb, gallery_embeddings.t()).squeeze(0)
         topk_indices = torch.topk(
             scores, min(fetch_k, len(valid_corpus_ids))
@@ -229,21 +287,23 @@ def mine_hard_negatives_composed(
         for pos_id in relevant_ids:
             if pos_id not in dataset.corpus:
                 continue
-            pos_source = dataset.corpus[pos_id]
+            pos_image, pos_text = dataset.corpus[pos_id]
             for neg_id in hard_neg_ids[:n_negatives]:
-                neg_source = dataset.corpus[neg_id]
+                neg_image, neg_text = dataset.corpus[neg_id]
                 triplets.append(
                     ComposedTriplet(
                         query_image=query_image_src,
                         query_text=query_text,
-                        positive=pos_source,
-                        negative=neg_source,
+                        positive_image=pos_image,
+                        positive_text=pos_text,
+                        negative_image=neg_image,
+                        negative_text=neg_text,
                     )
                 )
 
     print(
         f"Mined {len(triplets)} composed triplets "
-        f"({len(query_ids)} queries, {n_negatives} negatives each)"
+        f"({len(valid_query_ids)} queries, {n_negatives} negatives each)"
     )
     return triplets
 

@@ -1,4 +1,4 @@
-"""Tests for composed (image+text → image) retrieval."""
+"""Tests for composed retrieval (mixed-mode)."""
 
 import json
 import tempfile
@@ -48,12 +48,12 @@ def small_composed_dataset(image_dir):
             "q2": ("ref2.jpg", "make it green"),
         },
         corpus={
-            "d1": "target1.jpg",
-            "d2": "target2.jpg",
-            "d3": "neg1.jpg",
-            "d4": "neg2.jpg",
-            "d5": "neg3.jpg",
-            "d6": "neg4.jpg",
+            "d1": ("target1.jpg", ""),
+            "d2": ("target2.jpg", ""),
+            "d3": ("neg1.jpg", ""),
+            "d4": ("neg2.jpg", ""),
+            "d5": ("neg3.jpg", ""),
+            "d6": ("neg4.jpg", ""),
         },
         qrels={
             "q1": {"d1": 1},
@@ -117,24 +117,26 @@ class TestComposedDataset:
 
 class TestComposedData:
     def test_triplet_fields(self):
-        t = ComposedTriplet("ref.jpg", "make it blue", "target.jpg", "neg.jpg")
+        t = ComposedTriplet("ref.jpg", "make it blue", "target.jpg", "red dress", "neg.jpg", "blue dress")
         assert t.query_image == "ref.jpg"
         assert t.query_text == "make it blue"
-        assert t.positive == "target.jpg"
-        assert t.negative == "neg.jpg"
+        assert t.positive_image == "target.jpg"
+        assert t.positive_text == "red dress"
+        assert t.negative_image == "neg.jpg"
+        assert t.negative_text == "blue dress"
 
     def test_triplet_dataset(self):
         triplets = [
-            ComposedTriplet("r1.jpg", "caption 1", "t1.jpg", "n1.jpg"),
-            ComposedTriplet("r2.jpg", "caption 2", "t2.jpg", "n2.jpg"),
+            ComposedTriplet("r1.jpg", "caption 1", "t1.jpg", "", "n1.jpg", ""),
+            ComposedTriplet("r2.jpg", "caption 2", "t2.jpg", "", "n2.jpg", ""),
         ]
         ds = ComposedTripletDataset(triplets)
         assert len(ds) == 2
-        q_img, q_text, pos, neg = ds[0]
+        q_img, q_text, pos_img, pos_txt, neg_img, neg_txt = ds[0]
         assert q_img == "r1.jpg"
         assert q_text == "caption 1"
-        assert pos == "t1.jpg"
-        assert neg == "n1.jpg"
+        assert pos_img == "t1.jpg"
+        assert neg_img == "n1.jpg"
 
     def test_random_negatives(self, small_composed_dataset):
         triplets = build_random_negatives_composed(
@@ -152,8 +154,8 @@ class TestComposedData:
             assert qid is not None
             relevant = set(small_composed_dataset.qrels[qid].keys())
             neg_id = None
-            for did, src in small_composed_dataset.corpus.items():
-                if src == t.negative:
+            for did, (img_src, txt) in small_composed_dataset.corpus.items():
+                if img_src == t.negative_image:
                     neg_id = did
                     break
             assert neg_id not in relevant
@@ -169,8 +171,10 @@ class TestComposedData:
         for a, b in zip(t1, t2):
             assert a.query_image == b.query_image
             assert a.query_text == b.query_text
-            assert a.positive == b.positive
-            assert a.negative == b.negative
+            assert a.positive_image == b.positive_image
+            assert a.positive_text == b.positive_text
+            assert a.negative_image == b.negative_image
+            assert a.negative_text == b.negative_text
 
 
 # ── Config tests ──────────────────────────────────────────────────
@@ -239,7 +243,7 @@ class TestComposedModel:
 
 class TestComposedTrainer:
     def test_custom_model_training(self, image_dir, small_composed_dataset):
-        """Test training with custom encode functions."""
+        """Test training with custom encode function."""
         embed_dim = 32
 
         class DummyModel(torch.nn.Module):
@@ -252,14 +256,10 @@ class TestComposedTrainer:
 
         model = DummyModel()
 
-        def encode_query(images, texts):
+        def encode_fn(images, texts):
             device = next(model.parameters()).device
-            emb = torch.randn(len(images), embed_dim, device=device)
-            return model(emb)
-
-        def encode_image(images):
-            device = next(model.parameters()).device
-            emb = torch.randn(len(images), embed_dim, device=device)
+            n = len(images) if images is not None else len(texts)
+            emb = torch.randn(n, embed_dim, device=device)
             return model(emb)
 
         triplets = build_random_negatives_composed(
@@ -278,8 +278,7 @@ class TestComposedTrainer:
 
         trainer = ComposedTrainer(
             model=model,
-            encode_query_fn=encode_query,
-            encode_image_fn=encode_image,
+            encode_fn=encode_fn,
             config=config,
         )
         ds = ComposedTripletDataset(triplets)

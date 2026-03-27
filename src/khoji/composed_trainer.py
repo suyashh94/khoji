@@ -1,4 +1,4 @@
-"""Training loop for composed (image+text → image) fine-tuning."""
+"""Training loop for composed retrieval fine-tuning (mixed-mode)."""
 
 from __future__ import annotations
 
@@ -49,21 +49,21 @@ class ComposedTrainingConfig:
 
 
 class ComposedTrainer:
-    """Fine-tunes a joint model on composed retrieval triplets.
+    """Fine-tunes a joint model on mixed-mode retrieval triplets.
 
-    Queries are (image + text) pairs encoded jointly, while positives
-    and negatives are image-only encodings.
+    Queries, positives, and negatives can each be image-only, text-only,
+    or image+text. The encode function dispatches based on which modalities
+    are present.
 
-    **HuggingFace BLIP-2** (auto-wires encode functions):
+    **HuggingFace BLIP-2** (auto-wires encode function):
 
         trainer = ComposedTrainer("Salesforce/blip2-itm-vit-g", config)
 
-    **Custom model** — provide model + encode functions:
+    **Custom model** — provide model + encode function:
 
         trainer = ComposedTrainer(
             model=my_model,
-            encode_query_fn=my_joint_fn,   # (images, texts) -> Tensor
-            encode_image_fn=my_image_fn,   # (images) -> Tensor
+            encode_fn=my_fn,  # (images | None, texts | None) -> Tensor
             config=config,
         )
 
@@ -71,10 +71,9 @@ class ComposedTrainer:
         model_name: HuggingFace model ID (BLIP-2).
         config: Training configuration.
         model: Custom nn.Module for parameters/LoRA/save.
-        encode_query_fn: Custom joint encoding function.
-            ``(images: list[Image], texts: list[str]) -> Tensor (batch, dim)``.
-        encode_image_fn: Custom image encoding function.
-            ``(images: list[Image]) -> Tensor (batch, dim)``.
+        encode_fn: Custom encoding function.
+            ``(images: list[Image] | None, texts: list[str] | None) -> Tensor``.
+            At least one of images or texts will be non-None.
         adapter_path: Path to saved LoRA adapter for warm-starting.
     """
 
@@ -83,11 +82,11 @@ class ComposedTrainer:
         model_name: str | None = None,
         config: ComposedTrainingConfig | None = None,
         model: torch.nn.Module | None = None,
-        encode_query_fn: (
-            Callable[[list[Image.Image], list[str]], torch.Tensor] | None
-        ) = None,
-        encode_image_fn: (
-            Callable[[list[Image.Image]], torch.Tensor] | None
+        encode_fn: (
+            Callable[
+                [list[Image.Image] | None, list[str] | None], torch.Tensor
+            ]
+            | None
         ) = None,
         adapter_path: str | None = None,
     ):
@@ -95,18 +94,16 @@ class ComposedTrainer:
         self.config = config or ComposedTrainingConfig()
         self.device = get_device()
 
-        if model is not None and encode_query_fn is not None and encode_image_fn is not None:
+        if model is not None and encode_fn is not None:
             self.model = model.to(self.device)
-            self._encode_query_fn = encode_query_fn
-            self._encode_image_fn = encode_image_fn
+            self._encode_fn = encode_fn
 
         elif model_name is not None:
             self._load_hf_model(model_name)
 
         else:
             raise ValueError(
-                "Provide either model_name or "
-                "(model + encode_query_fn + encode_image_fn)."
+                "Provide either model_name or (model + encode_fn)."
             )
 
         # Apply LoRA
@@ -143,7 +140,7 @@ class ComposedTrainer:
         )
 
     def _load_hf_model(self, model_name: str) -> None:
-        """Load BLIP-2 and wire up encode functions."""
+        """Load BLIP-2 and wire up a unified encode function."""
         from transformers import AutoConfig, Blip2ForImageTextRetrieval
 
         model_config = AutoConfig.from_pretrained(model_name)
@@ -167,39 +164,55 @@ class ComposedTrainer:
         self.model = full_model
         self._processor = AutoProcessor.from_pretrained(model_name)
 
-        # Wire encode functions via closures
+        # Unified encode closure dispatching on which inputs are present
         device = self.device
         processor = self._processor
 
-        def _encode_query(images: list[Image.Image], texts: list[str]) -> torch.Tensor:
-            """Encode (image + text) composed query."""
-            inputs = processor(
-                images=images, text=texts,
-                return_tensors="pt", padding=True, truncation=True,
-            ).to(device)
-            base = self.model
-            if hasattr(base, "base_model"):
-                base = base.base_model.model
-            out = base(**inputs, use_image_text_matching_head=False)
-            img_emb = out.image_embeds.max(dim=1).values
-            txt_emb = out.text_embeds
-            return img_emb + txt_emb
+        def _encode(
+            images: list[Image.Image] | None,
+            texts: list[str] | None,
+        ) -> torch.Tensor:
+            """Encode in image-only, text-only, or joint mode."""
+            if images is not None and texts is not None:
+                # Joint (image + text) mode
+                inputs = processor(
+                    images=images, text=texts,
+                    return_tensors="pt", padding=True, truncation=True,
+                ).to(device)
+                base = self.model
+                if hasattr(base, "base_model"):
+                    base = base.base_model.model
+                out = base(**inputs, use_image_text_matching_head=False)
+                return out.image_embeds.max(dim=1).values + out.text_embeds
+            elif images is not None:
+                # Image-only mode
+                dummy_texts = [""] * len(images)
+                inputs = processor(
+                    images=images, text=dummy_texts,
+                    return_tensors="pt", padding=True, truncation=True,
+                ).to(device)
+                base = self.model
+                if hasattr(base, "base_model"):
+                    base = base.base_model.model
+                out = base(**inputs, use_image_text_matching_head=False)
+                return out.image_embeds.max(dim=1).values
+            elif texts is not None:
+                # Text-only mode
+                dummy = Image.new("RGB", (224, 224), "black")
+                dummy_images = [dummy] * len(texts)
+                inputs = processor(
+                    images=dummy_images, text=texts,
+                    return_tensors="pt", padding=True, truncation=True,
+                ).to(device)
+                base = self.model
+                if hasattr(base, "base_model"):
+                    base = base.base_model.model
+                out = base(**inputs, use_image_text_matching_head=False)
+                return out.text_embeds
+            else:
+                raise ValueError("At least one of images or texts must be provided.")
 
-        def _encode_images(images: list[Image.Image]) -> torch.Tensor:
-            """Encode images only."""
-            dummy_texts = [""] * len(images)
-            inputs = processor(
-                images=images, text=dummy_texts,
-                return_tensors="pt", padding=True, truncation=True,
-            ).to(device)
-            base = self.model
-            if hasattr(base, "base_model"):
-                base = base.base_model.model
-            out = base(**inputs, use_image_text_matching_head=False)
-            return out.image_embeds.max(dim=1).values
-
-        self._encode_query_fn = _encode_query
-        self._encode_image_fn = _encode_images
+        self._encode_fn = _encode
 
         dtype_str = (
             f" | dtype: {self.config.dtype}"
@@ -255,16 +268,40 @@ class ComposedTrainer:
             cache_dir=self.config.cache_dir,
         )
 
-    def _encode_query_batch(
-        self, query_images: list[Image.Image], query_texts: list[str]
+    def _encode_batch(
+        self,
+        images: list[Image.Image | None],
+        texts: list[str],
     ) -> torch.Tensor:
-        """Encode composed query batch and normalize."""
-        emb = self._encode_query_fn(query_images, query_texts)
-        return torch.nn.functional.normalize(emb, p=2, dim=1)
+        """Encode a mixed-mode batch and normalize.
 
-    def _encode_image_batch(self, images: list[Image.Image]) -> torch.Tensor:
-        """Encode image batch and normalize."""
-        emb = self._encode_image_fn(images)
+        Dispatches to image-only, text-only, or joint mode based on
+        which inputs are present. Falls back to item-by-item encoding
+        if the batch contains mixed modes.
+        """
+        has_imgs = [img is not None for img in images]
+        has_txts = [t != "" for t in texts]
+
+        all_img = all(has_imgs)
+        no_img = not any(has_imgs)
+        all_txt = all(has_txts)
+        no_txt = not any(has_txts)
+
+        if all_img and all_txt:
+            emb = self._encode_fn(images, texts)  # type: ignore[arg-type]
+        elif all_img and no_txt:
+            emb = self._encode_fn(images, None)  # type: ignore[arg-type]
+        elif no_img and all_txt:
+            emb = self._encode_fn(None, texts)
+        else:
+            # Mixed modes within batch — encode item by item
+            embs = []
+            for img, txt in zip(images, texts):
+                i_arg = [img] if img is not None else None
+                t_arg = [txt] if txt != "" else None
+                embs.append(self._encode_fn(i_arg, t_arg))
+            emb = torch.cat(embs, dim=0)
+
         return torch.nn.functional.normalize(emb, p=2, dim=1)
 
     def train(self, dataset: ComposedTripletDataset) -> TrainHistory:
@@ -346,16 +383,21 @@ class ComposedTrainer:
             epoch_batches = 0
             optimizer.zero_grad()
 
-            for batch_idx, (q_img_srcs, q_texts, pos_srcs, neg_srcs) in enumerate(
-                dataloader
-            ):
-                # Load images for this batch
-                q_imgs = [self._load_image(s) for s in q_img_srcs]
-                p_imgs = [self._load_image(s) for s in pos_srcs]
-                n_imgs = [self._load_image(s) for s in neg_srcs]
+            for batch_idx, (
+                q_img_srcs, q_texts,
+                pos_img_srcs, pos_texts,
+                neg_img_srcs, neg_texts,
+            ) in enumerate(dataloader):
+                # Load images for this batch ("" -> None)
+                q_imgs = [self._load_image(s) if s != "" else None for s in q_img_srcs]
+                p_imgs = [self._load_image(s) if s != "" else None for s in pos_img_srcs]
+                n_imgs = [self._load_image(s) if s != "" else None for s in neg_img_srcs]
 
-                # Skip batch if any image failed to load
-                if any(img is None for img in q_imgs + p_imgs + n_imgs):
+                # Skip batch if a non-empty source failed to load
+                def _any_failed(srcs, loaded):
+                    return any(s != "" and img is None for s, img in zip(srcs, loaded))
+
+                if _any_failed(q_img_srcs, q_imgs) or _any_failed(pos_img_srcs, p_imgs) or _any_failed(neg_img_srcs, n_imgs):
                     pbar.update(1)
                     continue
 
@@ -364,14 +406,14 @@ class ComposedTrainer:
                         device_type=self.device.type,
                         dtype=self.amp_dtype,
                     ):
-                        q = self._encode_query_batch(q_imgs, list(q_texts))
-                        p = self._encode_image_batch(p_imgs)
-                        n = self._encode_image_batch(n_imgs)
+                        q = self._encode_batch(q_imgs, list(q_texts))
+                        p = self._encode_batch(p_imgs, list(pos_texts))
+                        n = self._encode_batch(n_imgs, list(neg_texts))
                         loss = self.config.loss_fn(q, p, n)
                 else:
-                    q = self._encode_query_batch(q_imgs, list(q_texts))
-                    p = self._encode_image_batch(p_imgs)
-                    n = self._encode_image_batch(n_imgs)
+                    q = self._encode_batch(q_imgs, list(q_texts))
+                    p = self._encode_batch(p_imgs, list(pos_texts))
+                    n = self._encode_batch(n_imgs, list(neg_texts))
                     loss = self.config.loss_fn(q, p, n)
 
                 scaled = loss / self.config.grad_accum_steps
@@ -484,22 +526,27 @@ class ComposedTrainer:
 
         q_img_srcs = [s[0] for s in samples]
         q_texts = [s[1] for s in samples]
-        pos_srcs = [s[2] for s in samples]
-        neg_srcs = [s[3] for s in samples]
+        pos_img_srcs = [s[2] for s in samples]
+        pos_texts = [s[3] for s in samples]
+        neg_img_srcs = [s[4] for s in samples]
+        neg_texts = [s[5] for s in samples]
 
-        q_imgs = [self._load_image(s) for s in q_img_srcs]
-        p_imgs = [self._load_image(s) for s in pos_srcs]
-        n_imgs = [self._load_image(s) for s in neg_srcs]
+        q_imgs = [self._load_image(s) if s != "" else None for s in q_img_srcs]
+        p_imgs = [self._load_image(s) if s != "" else None for s in pos_img_srcs]
+        n_imgs = [self._load_image(s) if s != "" else None for s in neg_img_srcs]
 
-        # Skip if any image loading fails
-        if any(img is None for img in q_imgs + p_imgs + n_imgs):
+        # Skip if a non-empty source failed to load
+        def _any_failed(srcs, loaded):
+            return any(s != "" and img is None for s, img in zip(srcs, loaded))
+
+        if _any_failed(q_img_srcs, q_imgs) or _any_failed(pos_img_srcs, p_imgs) or _any_failed(neg_img_srcs, n_imgs):
             print(f"\n  [{label}] Sanity check skipped (image loading failed)")
             self.model.train()
             return
 
-        q_emb = self._encode_query_batch(q_imgs, q_texts)
-        p_emb = self._encode_image_batch(p_imgs)
-        n_emb = self._encode_image_batch(n_imgs)
+        q_emb = self._encode_batch(q_imgs, q_texts)
+        p_emb = self._encode_batch(p_imgs, pos_texts)
+        n_emb = self._encode_batch(n_imgs, neg_texts)
 
         pos_sim = torch.nn.functional.cosine_similarity(q_emb, p_emb)
         neg_sim = torch.nn.functional.cosine_similarity(q_emb, n_emb)
