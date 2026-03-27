@@ -70,13 +70,13 @@ def build_composed_dataset(
         gallery_ids = json.load(f)
 
     queries: dict[str, tuple[str, str]] = {}
-    corpus: dict[str, str] = {}
+    corpus: dict[str, tuple[str, str]] = {}
     qrels: dict[str, dict[str, int]] = {}
 
-    # Build corpus from gallery IDs
+    # Build corpus from gallery IDs (image-only)
     for gid in gallery_ids:
         if gid in url_mapping:
-            corpus[gid] = url_mapping[gid]
+            corpus[gid] = (url_mapping[gid], "")
 
     # Build queries from annotations
     for i, ann in enumerate(annotations):
@@ -123,8 +123,13 @@ def save_as_custom_format(
             f.write(json.dumps({"_id": qid, "image": image, "text": text}) + "\n")
 
     with open(out / "corpus.jsonl", "w") as f:
-        for did, image in dataset.corpus.items():
-            f.write(json.dumps({"_id": did, "image": image}) + "\n")
+        for did, (image, text) in dataset.corpus.items():
+            entry = {"_id": did}
+            if image:
+                entry["image"] = image
+            if text:
+                entry["text"] = text
+            f.write(json.dumps(entry) + "\n")
 
     with open(out / "qrels.tsv", "w") as f:
         for qid, docs in dataset.qrels.items():
@@ -190,6 +195,7 @@ def run_config_approach(args):
             dataset=val_dir,
             k_values=[1, 5, 10, 50],
             n_queries=args.max_eval_queries,
+            corpus_size=args.eval_corpus_size,
             run_before=True,
             run_after=True,
         ),
@@ -234,11 +240,16 @@ def run_api_approach(args):
         dataset_name=f"fashioniq-{args.category}",
         dataset=val_ds,
         k_values=[1, 5, 10, 50],
+        batch_size=args.eval_batch_size,
         n_queries=args.max_eval_queries,
+        corpus_size=args.eval_corpus_size,
         cache_dir=str(cache_path) if cache_path else None,
     )
     baseline.print()
     baseline.save(str(out_path / "baseline.json"))
+    del baseline_eval
+    import torch
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # --- Build triplets (random negatives for simplicity) ---
     print("\n--- Building triplets ---")
@@ -266,6 +277,8 @@ def run_api_approach(args):
     trainer = khoji.ComposedTrainer(MODEL, training_config)
     history = trainer.train(torch_ds)
     history.save(str(out_path / "train_history.json"))
+    del trainer
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # --- Fine-tuned evaluation ---
     print("\n--- Fine-tuned ---")
@@ -276,7 +289,9 @@ def run_api_approach(args):
         dataset_name=f"fashioniq-{args.category}",
         dataset=val_ds,
         k_values=[1, 5, 10, 50],
+        batch_size=args.eval_batch_size,
         n_queries=args.max_eval_queries,
+        corpus_size=args.eval_corpus_size,
         cache_dir=str(cache_path) if cache_path else None,
     )
     finetuned.print()
@@ -313,6 +328,10 @@ def main():
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument("--max-eval-queries", type=int, default=100)
+    parser.add_argument("--eval-corpus-size", type=int, default=None,
+                        help="Limit evaluation corpus size (None = full)")
+    parser.add_argument("--eval-batch-size", type=int, default=64,
+                        help="Batch size for encoding during evaluation")
     parser.add_argument("--output-dir", default="./output/composed-retrieval-api")
     args = parser.parse_args()
 

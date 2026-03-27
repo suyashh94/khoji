@@ -65,6 +65,7 @@ class EvalConfig:
     split: str = "test"
     n_queries: int | None = None
     corpus_size: int | None = None
+    batch_size: int = 64  # batch size for encoding during evaluation
     run_before: bool = True  # evaluate baseline before training
     run_after: bool = True  # evaluate after training
 

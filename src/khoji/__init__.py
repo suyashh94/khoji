@@ -1,6 +1,6 @@
 """khoji: Fine-tune embedding models for domain-specific retrieval."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from khoji.config import ForgeConfig
 from khoji.data import (
@@ -35,7 +35,7 @@ from khoji.multimodal_run import run_multimodal
 from khoji.multimodal_trainer import MultimodalTrainer, MultimodalTrainingConfig
 from khoji.image_utils import load_image, load_images_batch
 
-# Composed (image+text → image)
+# Composed retrieval (mixed-mode: image, text, or both)
 from khoji.composed_config import ComposedForgeConfig
 from khoji.composed_data import (
     ComposedTriplet,
@@ -94,7 +94,7 @@ __all__ = [
     "load_images_batch",
     "mine_hard_negatives_multimodal",
     "run_multimodal",
-    # Composed (image+text → image)
+    # Composed retrieval (mixed-mode: image, text, or both)
     "ComposedEvaluator",
     "ComposedForgeConfig",
     "ComposedRetrievalDataset",

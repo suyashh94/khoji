@@ -55,6 +55,7 @@ class ComposedDataConfig:
     top_k: int = 50
     skip_top: int = 0
     mining_rounds: int = 1
+    mining_batch_size: int = 64  # batch size for encoding during hard negative mining
     cache_dir: str | None = None
 
 

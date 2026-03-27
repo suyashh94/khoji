@@ -1,4 +1,4 @@
-"""Orchestration for composed (image+text → image) training runs."""
+"""Orchestration for composed retrieval training runs (mixed-mode)."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ def _build_triplets_composed(
             n_negatives=config.data.n_negatives,
             top_k=config.data.top_k,
             skip_top=config.data.skip_top,
+            batch_size=config.data.mining_batch_size,
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
             cache_dir=config.data.cache_dir,
@@ -72,6 +73,7 @@ def _build_triplets_composed(
             n_hard=config.data.n_hard,
             top_k=config.data.top_k,
             skip_top=config.data.skip_top,
+            batch_size=config.data.mining_batch_size,
             n_queries=config.data.n_queries,
             corpus_size=config.data.corpus_size,
             cache_dir=config.data.cache_dir,
@@ -128,6 +130,7 @@ def run_composed(config: ComposedForgeConfig) -> RunResult:
         baseline = evaluator.evaluate(
             dataset_name=eval_source,
             k_values=config.eval.k_values,
+            batch_size=config.eval.batch_size,
             n_queries=config.eval.n_queries,
             corpus_size=config.eval.corpus_size,
             dataset=eval_dataset,
@@ -254,6 +257,7 @@ def run_composed(config: ComposedForgeConfig) -> RunResult:
         finetuned = finetuned_evaluator.evaluate(
             dataset_name=eval_source,
             k_values=config.eval.k_values,
+            batch_size=config.eval.batch_size,
             n_queries=config.eval.n_queries,
             corpus_size=config.eval.corpus_size,
             dataset=eval_dataset,

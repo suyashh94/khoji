@@ -2,13 +2,20 @@
 
 **Make retrieval models actually work on your data**
 
-[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture)
+[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture) | [Tutorial](#interactive-tutorial)
+
+> **Interactive Tutorial:** A comprehensive walkthrough with before/after retrieval examples, complete code, and visualizations for all four modes. Generate it locally:
+> ```bash
+> python scripts/collect_webpage_data.py   # collect retrieval examples (requires trained adapters)
+> python scripts/generate_khoji_webpage.py  # generate output/webpage/index.html
+> ```
+> Or run the training scripts first to produce the adapters, then generate the tutorial page.
 
 ---
 
 Pretrained retrieval models (BERT, CLIP, BLIP-2) are trained on generic web data. They work reasonably well out of the box, but struggle on domain-specific queries — legal documents, medical images, satellite imagery, fashion products, internal knowledge bases. The standard fix is fine-tuning, but wiring together the data pipeline, negative mining, LoRA, training loop, and evaluation for retrieval is a lot of boilerplate.
 
-khoji handles all of that. You point it at your data and a base model, and it fine-tunes a retrieval adapter using LoRA — with hard negative mining, standard IR evaluation, and support for text search, image search, and composed image retrieval (e.g., "find this dress but in red"). It works as a single YAML config for quick experiments, or as composable Python components when you need full control.
+khoji handles all of that. You point it at your data and a base model, and it fine-tunes a retrieval adapter using LoRA — with hard negative mining, standard IR evaluation, and support for text search, image search, and composed retrieval where queries and targets can be any mix of image and text (e.g., "find this dress but in red", or product search matching images with descriptions). Text and image search work as a single YAML config for quick experiments. All three modes offer composable Python components when you need full control.
 
 ### Three retrieval modes
 
@@ -16,13 +23,13 @@ khoji handles all of that. You point it at your data and a base model, and it fi
 |------|-------|--------|--------|----------|
 | **Text → Text** | text | text | BERT, BGE, sentence-transformers | Document search, FAQ matching, semantic search |
 | **Text → Image** | text | image | CLIP, SigLIP | Image search from text descriptions |
-| **(Image + Text) → Image** | reference image + modification caption | image | BLIP-2 | "Find me this dress but in red" |
+| **Composed (mixed-mode)** | image, text, or both | image, text, or both | BLIP-2 | "Find me this dress but in red", product search with metadata |
 
 ### Two levels of abstraction
 
 | Level | What you write | Best for |
 |-------|---------------|----------|
-| **Config-driven** | A YAML file → `run()` / `run_multimodal()` / `run_composed()` | Reproducible experiments, quick iteration |
+| **Config-driven** | A YAML file → `run()` / `run_multimodal()` | Reproducible experiments, quick iteration |
 | **Python API** | Compose individual components (model, trainer, evaluator, data) | Custom workflows, non-standard data sources, research |
 
 ### What you can plug in
@@ -93,14 +100,16 @@ config = MultimodalForgeConfig.from_yaml("configs/clip_rsicd_full.yaml")
 result = run_multimodal(config)
 ```
 
-### (Image + Text) → Image (Composed Retrieval)
+### Composed Retrieval (mixed-mode)
 
-```python
-from khoji import ComposedForgeConfig, run_composed
+Composed retrieval has more moving parts (image loading, multiple modalities, dataset conversion) than the other modes. Start with the example scripts rather than a YAML config:
 
-config = ComposedForgeConfig.from_yaml("composed_config.yaml")
-result = run_composed(config)
+```bash
+python scripts/fashioniq/download_data.py
+python scripts/train_composed_retrieval_api.py --category dress
 ```
+
+See [Section 3](#3-composed-retrieval-mixed-mode) for the full Python API.
 
 ---
 
@@ -408,63 +417,20 @@ Any CLIP or SigLIP variant on HuggingFace should work.
 
 ---
 
-### 3. (Image + Text) → Image (Composed Retrieval)
+### 3. Composed Retrieval (mixed-mode)
 
-Fine-tune joint encoder models (BLIP-2) for composed image retrieval: given a reference image and a modification caption ("make it red"), retrieve the correct target image from a gallery.
+Fine-tune joint encoder models (BLIP-2) for mixed-mode retrieval: queries and targets can each be image-only, text-only, or image+text. This covers composed image retrieval ("find this dress but in red"), product search with metadata, and any scenario where items combine visual and textual information.
 
-To try this out on FashionIQ (dress/shirt/toptee categories), download the annotations first:
+Composed retrieval has more moving parts than the other modes — image loading, multiple modalities per item, and dataset-specific conversion logic. **Start with the example scripts** rather than a YAML config:
 
 ```bash
 python scripts/fashioniq/download_data.py
 python scripts/train_composed_retrieval_api.py --category dress
 ```
 
-#### Config-driven
+The scripts handle FashionIQ data download, dataset conversion, training, and evaluation end-to-end. Once you understand the pipeline, use the Python API below to build your own workflows.
 
-```yaml
-model:
-  name: Salesforce/blip2-itm-vit-g
-  # adapter_path: null
-  # dtype: null
-
-data:
-  dataset: ./data/my_composed_dataset    # local directory
-  split: train
-  negatives: mixed
-  n_random: 2
-  n_hard: 1
-  top_k: 50
-  skip_top: 5
-  mining_rounds: 1
-  cache_dir: null
-
-lora:
-  r: 8
-  alpha: 16
-  dropout: 0.1
-
-train:
-  epochs: 5
-  batch_size: 8
-  lr: 2e-5
-  warmup_steps: 50
-  loss: infonce
-  temperature: 0.05
-
-eval:
-  k_values: [1, 5, 10, 50]
-  run_before: true
-  run_after: true
-
-output_dir: ./output/composed-retrieval
-```
-
-```python
-from khoji import ComposedForgeConfig, run_composed
-
-config = ComposedForgeConfig.from_yaml("composed_config.yaml")
-result = run_composed(config)
-```
+> **Note:** Unlike text and multimodal modes, composed retrieval does not have a `khoji composed <config.yaml>` CLI command. Use the Python API or the example scripts directly.
 
 #### Python API
 
@@ -499,14 +465,14 @@ evaluator = ComposedEvaluator(
 result = evaluator.evaluate(dataset=dataset, k_values=[1, 5, 10, 50])
 result.print()
 
-# 5. Inference
+# 5. Inference — queries and targets can be any combination of modalities
 model = JointEmbeddingModel(
     "Salesforce/blip2-itm-vit-g", adapter_path="./my-composed-adapter"
 )
 from khoji import load_image
 ref_img = load_image("reference.jpg")
-query_emb = model.encode(images=[ref_img], texts=["make it red"])
-gallery_emb = model.encode(images=[img1, img2, img3])
+query_emb = model.encode(images=[ref_img], texts=["make it red"])      # image + text query
+gallery_emb = model.encode(images=[img1, img2], texts=["red dress", "blue shirt"])  # image + text targets
 
 import torch
 scores = torch.mm(query_emb, gallery_emb.t()).squeeze(0)
@@ -515,18 +481,18 @@ best_match = scores.argmax().item()
 
 #### Custom composed datasets
 
-Composed datasets differ from the other two modes in one key way: each **query is an (image, text) pair**, not just text. The query says "here's a reference image, and here's what I want changed about it." The corpus (gallery) is still just images.
+Composed datasets differ from the other two modes: both queries and corpus items are `(image, text)` tuples. Either field can be `""` to indicate that modality is absent — enabling image-only, text-only, or image+text items.
 
 **Local files:**
 
 ```
 my_composed_dataset/
   queries.jsonl   # {"_id": "q1", "image": "imgs/ref.jpg", "text": "make it red"}
-  corpus.jsonl    # {"_id": "d1", "image": "imgs/target.jpg"}
+  corpus.jsonl    # {"_id": "d1", "image": "imgs/target.jpg", "text": "red dress, size M"}
   qrels.tsv       # q1\td1\t1
 ```
 
-Note that `queries.jsonl` has **both** an `image` and a `text` field. This is the key difference from the other modes.
+Both `"image"` and `"text"` fields are optional in queries and corpus — at least one must be present per item. This means you can mix modalities freely: image-only corpus items, text-only queries, or full image+text on both sides.
 
 **Python dicts:**
 
@@ -535,15 +501,15 @@ from khoji import ComposedRetrievalDataset
 
 dataset = ComposedRetrievalDataset(
     queries={
-        "q1": ("imgs/ref_dress.jpg", "make it red"),       # (reference_image, modification_text)
-        "q2": ("imgs/ref_shirt.jpg", "shorter sleeves"),
+        "q1": ("imgs/ref_dress.jpg", "make it red"),       # image + text query
+        "q2": ("", "red cocktail dress"),                   # text-only query
     },
     corpus={
-        "d1": "imgs/red_dress.jpg",
-        "d2": "imgs/short_sleeve_shirt.jpg",
-        "d3": "imgs/other.jpg",
+        "d1": ("imgs/red_dress.jpg", "red dress, size M"),  # image + text target
+        "d2": ("imgs/short_sleeve_shirt.jpg", ""),           # image-only target
+        "d3": ("imgs/other.jpg", "other item"),
     },
-    qrels={"q1": {"d1": 1}, "q2": {"d2": 1}},
+    qrels={"q1": {"d1": 1}, "q2": {"d1": 1}},
     base_dir="./my_dataset",    # resolve relative image paths from here
 )
 ```
@@ -773,9 +739,9 @@ The key difference between modes is **what your encode functions receive and ret
 |------|-----------------|-------|--------|
 | Text → Text | Wired automatically from model + tokenizer + pooling mode | — | — |
 | Text → Image | `encode_text_fn` and `encode_image_fn` | `list[str]` (texts) and `list[str]` (image file paths/URLs) | `Tensor (batch, dim)` each |
-| Composed | `encode_query_fn` and `encode_image_fn` | `(list[PIL.Image], list[str])` and `list[PIL.Image]` | `Tensor (batch, dim)` each |
+| Composed | `encode_fn` | `(list[PIL.Image] \| None, list[str] \| None)` | `Tensor (batch, dim)` |
 
-Note the difference: Text → Image `encode_image_fn` receives **file paths** (the trainer handles loading), while Composed `encode_image_fn` receives **PIL images** (the trainer loads images before calling your function).
+Note the difference: Text → Image `encode_image_fn` receives **file paths** (the trainer handles loading), while Composed `encode_fn` receives **PIL images** (the trainer loads images before calling your function).
 
 #### Text → Text
 
@@ -827,21 +793,17 @@ trainer = MultimodalTrainer(
 )
 ```
 
-#### (Image + Text) → Image
+#### Composed (mixed-mode)
 
-You provide two encode functions. Both receive **PIL images** (not file paths — the trainer loads images before calling your functions).
-
-- `encode_query_fn(images, texts)`: Encode (reference_image + caption) pairs jointly
-- `encode_image_fn(images)`: Encode target/gallery images
+You provide a single encode function that handles image-only, text-only, or joint mode based on which inputs are non-None. The trainer loads images before calling your function.
 
 ```python
 from khoji import ComposedTrainer, ComposedTrainingConfig, JointEmbeddingModel
 
 # For training
 trainer = ComposedTrainer(
-    model=my_model,                # nn.Module holding all parameters
-    encode_query_fn=my_joint_fn,   # (list[PIL.Image], list[str]) -> Tensor (batch, dim)
-    encode_image_fn=my_image_fn,   # (list[PIL.Image]) -> Tensor (batch, dim)
+    model=my_model,          # nn.Module holding all parameters
+    encode_fn=my_encode_fn,  # (list[PIL.Image]|None, list[str]|None) -> Tensor (batch, dim)
     config=ComposedTrainingConfig(
         epochs=3,
         lora=None,
@@ -965,7 +927,7 @@ src/khoji/
   multimodal_trainer.py     MultimodalTrainer
   multimodal_evaluator.py   MultimodalEvaluator
 
-  # ── (Image + Text) → Image ───────────────────
+  # ── Composed (mixed-mode) ────────────────────
   composed_config.py        ComposedForgeConfig
   composed_run.py           run_composed()
   composed_dataset.py       load_custom_composed, ComposedRetrievalDataset
@@ -1014,24 +976,24 @@ Config (YAML or Python)
 | `scripts/train_multimodal_retrieval.py` | Text → Image | Config-driven + manual API on RSICD |
 | `scripts/train_composed_retrieval.py` | Composed | Standalone FashionIQ training (low-level) |
 | `scripts/train_composed_retrieval_api.py` | Composed | Config-driven + manual API on FashionIQ |
+| `scripts/train_sku_matching.py` | Mixed-mode | Cross-brand SKU matching (img+txt → img+txt) on AI-generated grocery data |
 | `scripts/fashioniq/download_data.py` | Data setup | Download FashionIQ annotations (required for composed scripts) |
 
-The composed retrieval scripts require FashionIQ annotations. Download them first:
+#### FashionIQ (composed retrieval)
 
 ```bash
-python scripts/fashioniq/download_data.py          # default: ./data/fashioniq
-python scripts/fashioniq/download_data.py ./my_dir  # custom output directory
+python scripts/fashioniq/download_data.py
+python scripts/train_composed_retrieval_api.py --approach api
 ```
 
-This downloads captions, image splits, and ASIN-to-URL mappings (~3 categories: dress, shirt, toptee). Images are fetched on-the-fly from URLs during training and cached locally. Then run either composed script:
+#### SKU Matching (mixed-mode: img+txt → img+txt)
+
+Cross-brand product matching using AI-generated grocery product images. One model trained, evaluated on two generalization dimensions (unseen brand + unseen product families). See [`data/sku-matching/README.md`](data/sku-matching/README.md) for dataset details and [`notebooks/05_sku_matching_mixed_mode.ipynb`](notebooks/05_sku_matching_mixed_mode.ipynb) for a full walkthrough with visualizations.
 
 ```bash
-python scripts/train_composed_retrieval.py                          # standalone low-level script
-python scripts/train_composed_retrieval.py --category shirt         # different category
-
-python scripts/train_composed_retrieval_api.py                      # uses khoji API
-python scripts/train_composed_retrieval_api.py --approach api       # manual API only
-python scripts/train_composed_retrieval_api.py --approach config    # config-driven only
+python scripts/train_sku_matching.py                                          # default: mixed negatives, 2 rounds
+python scripts/train_sku_matching.py --negatives mixed --mining-rounds 2      # explicit
+python scripts/train_sku_matching.py --epochs 10 --batch-size 64             # tune hyperparams
 ```
 
 ---
@@ -1094,7 +1056,7 @@ uv run ruff check src/ tests/
 
 - [x] Text → Text retrieval (BERT, BGE, sentence-transformers)
 - [x] Text → Image retrieval (CLIP, SigLIP)
-- [x] (Image + Text) → Image composed retrieval (BLIP-2)
+- [x] Composed mixed-mode retrieval (BLIP-2) — image, text, or both on query and target sides
 - [x] Full fine-tuning (`lora: null`)
 - [x] Custom models, loss functions, metrics
 - [ ] Validation loss tracking during training

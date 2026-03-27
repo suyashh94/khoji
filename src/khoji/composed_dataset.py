@@ -1,4 +1,4 @@
-"""Dataset loading for composed (image+text → image) retrieval."""
+"""Dataset loading for composed retrieval (mixed-mode: image, text, or both)."""
 
 from __future__ import annotations
 
@@ -10,45 +10,46 @@ from pathlib import Path
 
 @dataclass
 class ComposedRetrievalDataset:
-    """Retrieval dataset for composed queries: (reference image + text) → target image.
+    """Mixed-mode retrieval dataset where queries and targets can be
+    image-only, text-only, or image+text.
 
-    Each query is a pair of (reference_image, modification_text), and the
-    goal is to retrieve the correct target image from the gallery.
+    Each item is an ``(image_source, text)`` tuple where ``""`` means
+    the modality is absent.
 
     Construct directly for custom datasets::
 
         dataset = ComposedRetrievalDataset(
             queries={"q1": ("ref_img.jpg", "make it red")},
-            corpus={"d1": "images/target.jpg", "d2": "images/other.jpg"},
+            corpus={"d1": ("images/target.jpg", "organic apple"), "d2": ("images/other.jpg", "")},
             qrels={"q1": {"d1": 1}},
             base_dir="./my_dataset",
         )
 
     Args:
-        queries: query_id -> (reference_image_source, modification_text).
-        corpus: doc_id -> image source (local path or URL).
+        queries: query_id -> (image_source, text). Use ``""`` for absent modality.
+        corpus: doc_id -> (image_source, text). Use ``""`` for absent modality.
         qrels: query_id -> {doc_id -> relevance_score}.
         base_dir: Base directory for resolving relative image paths.
     """
 
-    queries: dict[str, tuple[str, str]]  # query_id -> (image_source, text)
-    corpus: dict[str, str]  # doc_id -> image source
+    queries: dict[str, tuple[str, str]]  # query_id -> (image_source, text); "" = absent
+    corpus: dict[str, tuple[str, str]]  # doc_id -> (image_source, text); "" = absent
     qrels: dict[str, dict[str, int]]
     base_dir: str | None = None
 
 
 def load_custom_composed(path: str) -> ComposedRetrievalDataset:
-    """Load a custom composed retrieval dataset from a local directory.
+    """Load a custom mixed-mode retrieval dataset from a local directory.
 
     Expected directory structure::
 
         my_dataset/
             queries.jsonl   # {"_id": "q1", "image": "imgs/ref.jpg", "text": "make it red"}
-            corpus.jsonl    # {"_id": "d1", "image": "imgs/target.jpg"}
+            corpus.jsonl    # {"_id": "d1", "image": "imgs/target.jpg", "text": "organic apple"}
             qrels.tsv       # q1\\td1\\t1 (tab-separated, no header)
 
-    Image paths in queries.jsonl and corpus.jsonl are relative to the
-    dataset directory. URLs (http/https) are also supported.
+    Both ``"image"`` and ``"text"`` fields are optional in queries and corpus.
+    At least one must be present per item. Missing fields default to ``""``.
 
     Args:
         path: Path to the dataset directory.
@@ -70,18 +71,18 @@ def load_custom_composed(path: str) -> ComposedRetrievalDataset:
     with open(queries_path) as f:
         for line in f:
             row = json.loads(line)
-            queries[str(row["_id"])] = (row["image"], row["text"])
+            queries[str(row["_id"])] = (row.get("image", ""), row.get("text", ""))
 
-    # --- Corpus (images) ---
+    # --- Corpus ---
     corpus_path = base / "corpus.jsonl"
     if not corpus_path.exists():
         raise FileNotFoundError(f"Missing corpus file: {corpus_path}")
 
-    corpus: dict[str, str] = {}
+    corpus: dict[str, tuple[str, str]] = {}
     with open(corpus_path) as f:
         for line in f:
             row = json.loads(line)
-            corpus[str(row["_id"])] = row["image"]
+            corpus[str(row["_id"])] = (row.get("image", ""), row.get("text", ""))
 
     # --- Qrels ---
     qrels_path = base / "qrels.tsv"
@@ -105,7 +106,7 @@ def load_custom_composed(path: str) -> ComposedRetrievalDataset:
 
     print(
         f"Loaded custom composed dataset from {base}: "
-        f"{len(queries)} queries, {len(corpus)} gallery images, "
+        f"{len(queries)} queries, {len(corpus)} corpus items, "
         f"{sum(len(d) for d in qrels.values())} relevance judgments"
     )
 

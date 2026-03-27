@@ -95,16 +95,18 @@ def generate_multimodal_examples():
         top5_base = torch.topk(scores_base, 5).indices.tolist()
         top5_ft = torch.topk(scores_ft, 5).indices.tolist()
 
-        # Load images
+        # Load images (skip None on failure)
         imgs_base = []
         for idx in top5_base:
             img = load_image(corpus_sources[idx], base_dir=test_ds.base_dir)
-            imgs_base.append(img)
+            if img is not None:
+                imgs_base.append(img)
 
         imgs_ft = []
         for idx in top5_ft:
             img = load_image(corpus_sources[idx], base_dir=test_ds.base_dir)
-            imgs_ft.append(img)
+            if img is not None:
+                imgs_ft.append(img)
 
         # Create figure
         fig = plt.figure(figsize=(16, 7))
