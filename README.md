@@ -2,9 +2,9 @@
 
 **Make retrieval models actually work on your data**
 
-[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture) | [Tutorial](output/webpage/index.html)
+[Installation](#installation) | [Quick Start](#quick-start) | [Retrieval Modes](#retrieval-modes) | [Training Concepts](#training-concepts) | [Extensibility](#extensibility) | [Architecture](#architecture) | [**Tutorial &rarr;**](https://suyashh94.github.io/khoji/)
 
-> **Interactive Tutorial:** See the [full walkthrough with examples](output/webpage/index.html) — covers all four retrieval modes with real before/after results, code you can copy, and embedded retrieval visualizations.
+> **[Interactive Tutorial](https://suyashh94.github.io/khoji/)** — A comprehensive walkthrough covering all four retrieval modes with real before/after results, complete training code, custom model examples, and embedded retrieval visualizations.
 
 ---
 
